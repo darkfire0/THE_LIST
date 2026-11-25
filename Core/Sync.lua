@@ -124,12 +124,26 @@ local function FormatSendResult(res)
     return SEND_RESULT_NAMES[res] or ("Error#" .. tostring(res))
 end
 
+local function IsLockdownSendResult(res)
+    local r = _G.Enum and _G.Enum.SendAddonMessageResult
+    local lockdownCode = r and r.AddOnMessageLockdown or 11
+    return res == lockdownCode
+end
+
 local function OnChunkSendResult(ctx, didSend, sendResult)
+    if type(ctx) == "table" then
+        ctx.done = true
+        ctx.didSend = didSend == true
+        ctx.sendResult = sendResult
+    end
     if didSend then
         stats.sentChunksOk = stats.sentChunksOk + 1
         return
     end
     stats.sentChunksFail = stats.sentChunksFail + 1
+    if IsLockdownSendResult(sendResult) then
+        deferredHelloPending = true
+    end
     local errDesc = string.format("%s -> %s (%s)",
         tostring(ctx and ctx.transport or "?"),
         tostring(ctx and ctx.target or "channel"),
@@ -142,6 +156,7 @@ local function OnChunkSendResult(ctx, didSend, sendResult)
     local notInGuildCode = r and r.NotInGuild or 10
     if manualSyncAt > 0 and (now - manualSyncAt) <= 15
         and (now - lastSendErrorNoticeAt) >= 10
+        and not IsLockdownSendResult(sendResult)
         and sendResult ~= notInGroupCode and sendResult ~= notInGuildCode
     then
         lastSendErrorNoticeAt = now
@@ -149,87 +164,110 @@ local function OnChunkSendResult(ctx, didSend, sendResult)
     end
 end
 
-local function DispatchRawChunk(transport, target, chunk, prio)
+local function DispatchRawChunk(transport, target, chunk, prio, bypassLockdownGate)
     local sendPrio = (prio == "ALERT" or prio == "NORMAL" or prio == "BULK") and prio or "BULK"
-    if Guard.InCommLockdown() then
+    if transport ~= "BNET" and not bypassLockdownGate and Guard.InCommLockdown() then
         if #deferredQueue < MAX_DEFERRED_CHUNKS then
             deferredQueue[#deferredQueue + 1] = { transport = transport, target = target, chunk = chunk, prio = sendPrio }
         end
-        return false
+        return false, nil, true
     end
 
     local queueName = ns.COMM_PREFIX .. ":" .. tostring(transport) .. ":" .. tostring(target or "")
-    local ctx = { transport = transport, target = target }
+    local ctx = { transport = transport, target = target, done = false, didSend = false, sendResult = nil }
 
     if transport == "BNET" then
         if CTL and CTL.BNSendGameData then
             CTL:BNSendGameData(sendPrio, ns.COMM_PREFIX, chunk, "WHISPER", target, queueName, OnChunkSendResult, ctx)
-            return true
+            if ctx.done and not ctx.didSend then
+                return false, ctx.sendResult
+            end
+            return true, ctx.sendResult
         elseif _G.C_BattleNet and _G.C_BattleNet.SendGameData then
             local ok, res = pcall(_G.C_BattleNet.SendGameData, target, ns.COMM_PREFIX, chunk)
             local didSend = ok and (res == nil or res == true or res == 0)
             OnChunkSendResult(ctx, didSend, ok and res or false)
-            return didSend
+            return didSend, ctx.sendResult
         elseif _G.BNSendGameData then
             local ok, res = pcall(_G.BNSendGameData, target, ns.COMM_PREFIX, chunk)
             local didSend = ok and (res == nil or res == true or res == 0)
             OnChunkSendResult(ctx, didSend, ok and res or false)
-            return didSend
+            return didSend, ctx.sendResult
         end
-        return false
+        return false, nil
     end
 
     if CTL and CTL.SendAddonMessage then
         CTL:SendAddonMessage(sendPrio, ns.COMM_PREFIX, chunk, transport, target, queueName, OnChunkSendResult, ctx)
-        return true
+        if ctx.done and not ctx.didSend then
+            return false, ctx.sendResult
+        end
+        return true, ctx.sendResult
     elseif _G.C_ChatInfo and _G.C_ChatInfo.SendAddonMessage then
         local ok, res = pcall(_G.C_ChatInfo.SendAddonMessage, ns.COMM_PREFIX, chunk, transport, target)
         local didSend = ok and (res == nil or res == true or res == 0)
         OnChunkSendResult(ctx, didSend, ok and res or false)
-        return didSend
+        return didSend, ctx.sendResult
     end
-    return false
+    return false, nil
 end
 
-local function SendPacket(transport, target, pkt)
+local function SendPacket(transport, target, pkt, bypassLockdownGate)
     local s = DB:Settings()
-    if not s.syncEnabled then return false end
+    if not s.syncEnabled then return false, "disabled" end
 
-    if Guard.InCommLockdown() and pkt and pkt.t == "H" then
+    if transport ~= "BNET" and not bypassLockdownGate and Guard.InCommLockdown() and pkt and pkt.t == "H" then
         deferredHelloPending = true
-        return true
+        return true, nil
     end
 
     local encoded = EncodePacket(pkt)
-    if not encoded then return false end
+    if not encoded then return false, "encode_failed" end
 
     local prio = (pkt and pkt.t == "H") and "NORMAL" or "BULK"
 
     if #encoded <= CHUNK_LIMIT then
-        DispatchRawChunk(transport, target, "S|" .. encoded, prio)
+        local ok, res, wasDeferred = DispatchRawChunk(transport, target, "S|" .. encoded, prio, bypassLockdownGate)
+        if ok then
+            if pkt and pkt.t == "H" then
+                stats.sentHello = stats.sentHello + 1
+            elseif pkt and pkt.t == "D" then
+                stats.sentDelta = stats.sentDelta + 1
+            end
+        end
+        return ok or (wasDeferred == true), res
+    end
+
+    local total = math.ceil(#encoded / CHUNK_LIMIT)
+    if total > MAX_CHUNKS then return false, "too_large" end
+    local id = NextMsgID()
+    local allOk = true
+    local anyDeferred = false
+    local lastErr = nil
+    for i = 1, total do
+        local startIdx = (i - 1) * CHUNK_LIMIT + 1
+        local slice = encoded:sub(startIdx, startIdx + CHUNK_LIMIT - 1)
+        local frame = string.format("M|%s|%d/%d|%s", id, i, total, slice)
+        local ok, res, wasDeferred = DispatchRawChunk(transport, target, frame, prio, bypassLockdownGate)
+        if wasDeferred then
+            anyDeferred = true
+        elseif not ok then
+            allOk = false
+            lastErr = res
+            if i == 1 then
+                return false, res
+            end
+        end
+    end
+    if allOk or anyDeferred then
         if pkt and pkt.t == "H" then
             stats.sentHello = stats.sentHello + 1
         elseif pkt and pkt.t == "D" then
             stats.sentDelta = stats.sentDelta + 1
         end
-        return true
+        return true, lastErr
     end
-
-    local total = math.ceil(#encoded / CHUNK_LIMIT)
-    if total > MAX_CHUNKS then return false end
-    local id = NextMsgID()
-    for i = 1, total do
-        local startIdx = (i - 1) * CHUNK_LIMIT + 1
-        local slice = encoded:sub(startIdx, startIdx + CHUNK_LIMIT - 1)
-        local frame = string.format("M|%s|%d/%d|%s", id, i, total, slice)
-        DispatchRawChunk(transport, target, frame, prio)
-    end
-    if pkt and pkt.t == "H" then
-        stats.sentHello = stats.sentHello + 1
-    elseif pkt and pkt.t == "D" then
-        stats.sentDelta = stats.sentDelta + 1
-    end
-    return true
+    return false, lastErr
 end
 
 local function BuildVersionVector()
@@ -382,7 +420,7 @@ local function BuildRelayDelta(authorID, afterRev)
 end
 
 -- Send deltas in manageable batches so packets compress cleanly; recursively split if a batch exceeds MAX_CHUNKS
-local function SendBatchedSlice(transport, target, deltaPkt, items, startIdx, endIdx, sliceFromRev, isFinal)
+local function SendBatchedSlice(transport, target, deltaPkt, items, startIdx, endIdx, sliceFromRev, isFinal, bypassLockdownGate)
     local count = endIdx - startIdx + 1
     if count <= 0 then return end
     local slice = {}
@@ -400,24 +438,26 @@ local function SendBatchedSlice(transport, target, deltaPkt, items, startIdx, en
         toRev = sliceToRev,
         items = slice,
     }
-    if not SendPacket(transport, target, pkt) and count > 1 then
+    local ok, res = SendPacket(transport, target, pkt, bypassLockdownGate)
+    if not ok and res == "too_large" and count > 1 then
         local mid = startIdx + math.floor(count / 2) - 1
         local midRev = tonumber(items[mid].rev) or sliceFromRev
-        SendBatchedSlice(transport, target, deltaPkt, items, startIdx, mid, sliceFromRev, false)
-        SendBatchedSlice(transport, target, deltaPkt, items, mid + 1, endIdx, midRev, isFinal)
+        SendBatchedSlice(transport, target, deltaPkt, items, startIdx, mid, sliceFromRev, false, bypassLockdownGate)
+        SendBatchedSlice(transport, target, deltaPkt, items, mid + 1, endIdx, midRev, isFinal, bypassLockdownGate)
     end
 end
 
-local function SendBatchedDelta(transport, target, deltaPkt)
+local function SendBatchedDelta(transport, target, deltaPkt, bypassLockdownGate)
     if not deltaPkt or not DB:Settings().syncEnabled then return end
     if not LibSerialize or not LibDeflate then return end
     local items = deltaPkt.items or {}
     if #items <= 25 then
-        if not SendPacket(transport, target, deltaPkt) and #items > 1 then
+        local ok, res = SendPacket(transport, target, deltaPkt, bypassLockdownGate)
+        if not ok and res == "too_large" and #items > 1 then
             local mid = math.floor(#items / 2)
             local midRev = tonumber(items[mid].rev) or deltaPkt.fromRev
-            SendBatchedSlice(transport, target, deltaPkt, items, 1, mid, deltaPkt.fromRev, false)
-            SendBatchedSlice(transport, target, deltaPkt, items, mid + 1, #items, midRev, true)
+            SendBatchedSlice(transport, target, deltaPkt, items, 1, mid, deltaPkt.fromRev, false, bypassLockdownGate)
+            SendBatchedSlice(transport, target, deltaPkt, items, mid + 1, #items, midRev, true, bypassLockdownGate)
         end
         return
     end
@@ -426,7 +466,7 @@ local function SendBatchedDelta(transport, target, deltaPkt)
     while idx <= #items do
         local lastIdx = math.min(#items, idx + 24)
         local isFinal = (lastIdx == #items)
-        SendBatchedSlice(transport, target, deltaPkt, items, idx, lastIdx, curFromRev, isFinal)
+        SendBatchedSlice(transport, target, deltaPkt, items, idx, lastIdx, curFromRev, isFinal, bypassLockdownGate)
         curFromRev = tonumber(items[lastIdx].rev) or curFromRev
         idx = lastIdx + 1
     end
@@ -604,7 +644,7 @@ local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDispl
 
     local function SendReplies()
         for i = 1, #pendingDeltas do
-            SendBatchedDelta(replyTransport, replyTarget, pendingDeltas[i])
+            SendBatchedDelta(replyTransport, replyTarget, pendingDeltas[i], true)
         end
     end
 
@@ -628,7 +668,7 @@ local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDispl
             lastGuildHelloReplyAt = now
         end
         local hello = BuildHelloPacket()
-        if hello then SendPacket(replyTransport, replyTarget, hello) end
+        if hello then SendPacket(replyTransport, replyTarget, hello, true) end
     end
 
     ns:Emit("PEERS_CHANGED")
@@ -833,10 +873,6 @@ function Sync:BroadcastHello(force)
     if not s.syncEnabled then
         return { ok = false, reason = "disabled" }
     end
-    if Guard.InCommLockdown() then
-        deferredHelloPending = true
-        return { ok = false, reason = "lockdown", deferred = true }
-    end
 
     local hello = BuildHelloPacket()
     if not hello then
@@ -850,20 +886,51 @@ function Sync:BroadcastHello(force)
         partyChannel = nil,
         bnetCount = 0,
         bnetSkippedCooldown = 0,
+        lockdownBlocked = 0,
+        deferred = false,
+        lastSendError = nil,
     }
 
+    local function RecordChannelFailure(res)
+        if IsLockdownSendResult(res) then
+            status.lockdownBlocked = status.lockdownBlocked + 1
+            status.deferred = true
+            deferredHelloPending = true
+        elseif res ~= nil then
+            status.lastSendError = res
+        end
+    end
+
+    local inLockdown = Guard.InCommLockdown()
+
     if s.syncGuild and IsTransportAllowed("GUILD") and _G.IsInGuild and _G.IsInGuild() then
-        if SendPacket("GUILD", nil, hello) then
-            status.guild = true
+        if not force and inLockdown then
+            deferredHelloPending = true
+            status.deferred = true
+        else
+            local ok, res = SendPacket("GUILD", nil, hello, true)
+            if ok then
+                status.guild = true
+            else
+                RecordChannelFailure(res)
+            end
         end
     end
 
     if s.syncParty and IsTransportAllowed("PARTY") and _G.IsInGroup and _G.IsInGroup() then
         local chan = (_G.IsInGroup(_G.LE_PARTY_CATEGORY_INSTANCE) and "INSTANCE_CHAT")
             or ((_G.IsInRaid and _G.IsInRaid()) and "RAID" or "PARTY")
-        if SendPacket(chan, nil, hello) then
-            status.party = true
-            status.partyChannel = chan
+        if not force and inLockdown then
+            deferredHelloPending = true
+            status.deferred = true
+        else
+            local ok, res = SendPacket(chan, nil, hello, true)
+            if ok then
+                status.party = true
+                status.partyChannel = chan
+            else
+                RecordChannelFailure(res)
+            end
         end
     end
 
@@ -874,14 +941,22 @@ function Sync:BroadcastHello(force)
             local gid = accounts[i].gameAccountID
             local last = bnetKnownSent[gid] or 0
             if force or (now - last) >= HANDSHAKE_COOLDOWN then
-                bnetKnownSent[gid] = now
-                if SendPacket("BNET", gid, hello) then
+                local ok, res = SendPacket("BNET", gid, hello, true)
+                if ok then
+                    bnetKnownSent[gid] = now
                     status.bnetCount = status.bnetCount + 1
+                else
+                    RecordChannelFailure(res)
                 end
             else
                 status.bnetSkippedCooldown = status.bnetSkippedCooldown + 1
             end
         end
+    end
+
+    if not status.guild and not status.party and status.bnetCount == 0 and (status.lockdownBlocked > 0 or status.deferred) then
+        status.ok = false
+        status.reason = "lockdown"
     end
 
     return status
@@ -931,18 +1006,20 @@ function Sync:SyncWithPlayer(rawName)
     if not display then
         return { ok = false, reason = "invalid_target" }
     end
-    if Guard.InCommLockdown() then
-        return { ok = false, reason = "lockdown" }
-    end
     local hello = BuildHelloPacket()
     if not hello then
         return { ok = false, reason = "not_initialized" }
     end
     manualSyncAt = time()
-    if SendPacket("WHISPER", display, hello) then
+    local ok, res = SendPacket("WHISPER", display, hello, true)
+    if ok then
         return { ok = true, whisperTarget = display }
     end
-    return { ok = false, reason = "send_failed" }
+    if IsLockdownSendResult(res) then
+        deferredHelloPending = true
+        return { ok = false, reason = "lockdown", deferred = true, whisperTarget = display, sendResult = res }
+    end
+    return { ok = false, reason = "send_failed", sendResult = res }
 end
 
 function Sync:FormatSyncStatus(status)
@@ -953,13 +1030,15 @@ function Sync:FormatSyncStatus(status)
         if status.reason == "disabled" then
             return "In-game sync is disabled in Settings."
         elseif status.reason == "lockdown" then
-            if status.deferred then
-                return "Messaging lockdown active; sync queued for when combat/encounter ends."
+            if status.whisperTarget then
+                return "WoW blocked whisper sync (instance/encounter messaging lockdown); try again outside the instance/encounter."
             end
-            return "Messaging lockdown active; direct whisper sync cannot send right now."
+            return "WoW chat messaging lockdown is active (instance/encounter/PvP); sync queued to retry automatically when lockdown ends."
         elseif status.reason == "invalid_target" then
             local usageTarget = Guard.IsForever() and "PlayerName" or "Player-Realm"
             return "Invalid player name. Usage: /thelist sync " .. usageTarget
+        elseif status.reason == "send_failed" and status.sendResult ~= nil then
+            return "Sync send failed (" .. FormatSendResult(status.sendResult) .. ")."
         end
         return "Sync handshake could not be sent (" .. tostring(status.reason or "unknown") .. ")."
     end
@@ -989,7 +1068,10 @@ function Sync:FormatSyncStatus(status)
             flavorLabel, usageTarget
         )
     end
-    return "Sync handshake sent (" .. table.concat(targets, ", ") .. ")."
+    local suffix = (status.deferred or (status.lockdownBlocked or 0) > 0)
+        and "; other channels queued until messaging lockdown ends"
+        or ""
+    return "Sync handshake sent (" .. table.concat(targets, ", ") .. ")" .. suffix .. "."
 end
 
 function Sync:PrintDebugStatus()
@@ -1013,6 +1095,10 @@ function Sync:PrintDebugStatus()
     local inGuild = (_G.IsInGuild and _G.IsInGuild()) and "yes" or "no"
     local inGroup = (_G.IsInGroup and _G.IsInGroup()) and "yes" or "no"
     local flavorLabel = Guard.IsForever() and "Forever" or "Retail"
+    local diag = Guard.GetLockdownDiagnostics and Guard.GetLockdownDiagnostics() or {}
+    local activeRestr = (diag.restrictions and #diag.restrictions > 0)
+        and table.concat(diag.restrictions, ",")
+        or "none"
 
     ns.Print(string.format(
         "Sync Debug: prefix=%s (%s), lockdown=%s, enabled=%s, trust=%s, BNet=%s, Guild=%s, Party=%s, Relay=%s, id=%s, rev=%d",
@@ -1020,6 +1106,11 @@ function Sync:PrintDebugStatus()
         tostring(Guard.InCommLockdown()), tostring(s.syncEnabled), tostring(s.trustMode),
         tostring(s.syncBNet), tostring(s.syncGuild), tostring(s.syncParty), tostring(s.syncRelay),
         tostring(root and root.authorID), tonumber(root and root.revision) or 0
+    ))
+    ns.Print(string.format(
+        "Lockdown: inChat=%s, outRestrict=%s, active=[%s], inst=%s (%s)",
+        tostring(diag.inChatLockdown), tostring(diag.outgoingRestricted),
+        activeRestr, tostring(diag.instanceType), tostring(diag.instanceName)
     ))
     ns.Print(string.format(
         "Targets: BNConnected=%s, %sBNet=%d [%s], inGuild=%s, inGroup=%s, onlinePeers=%d",
@@ -1050,6 +1141,9 @@ function Sync:Init()
     Guard.SafeRegisterEvent(commFrame, "GROUP_JOINED")
     Guard.SafeRegisterEvent(commFrame, "PLAYER_REGEN_ENABLED")
     Guard.SafeRegisterEvent(commFrame, "ENCOUNTER_END")
+    Guard.SafeRegisterEvent(commFrame, "ADDON_RESTRICTION_STATE_CHANGED")
+    Guard.SafeRegisterEvent(commFrame, "ZONE_CHANGED_NEW_AREA")
+    Guard.SafeRegisterEvent(commFrame, "PLAYER_ENTERING_WORLD")
     if not Guard.IsForever() then
         Guard.SafeRegisterEvent(commFrame, "CHALLENGE_MODE_COMPLETED")
     end
@@ -1092,8 +1186,16 @@ function Sync:Init()
             if DB:Settings().syncEnabled and DB:Settings().syncParty and IsTransportAllowed("PARTY") then
                 ScheduleHello()
             end
-        elseif event == "PLAYER_REGEN_ENABLED" or event == "ENCOUNTER_END" or event == "CHALLENGE_MODE_COMPLETED" then
-            C_Timer.After(0.5, function() Sync:FlushDeferredQueue() end)
+        elseif event == "PLAYER_REGEN_ENABLED"
+            or event == "ENCOUNTER_END"
+            or event == "CHALLENGE_MODE_COMPLETED"
+            or event == "ADDON_RESTRICTION_STATE_CHANGED"
+            or event == "ZONE_CHANGED_NEW_AREA"
+            or event == "PLAYER_ENTERING_WORLD"
+        then
+            if not Guard.InCommLockdown() and Sync:GetDeferredCount() > 0 then
+                C_Timer.After(0.5, function() Sync:FlushDeferredQueue() end)
+            end
         elseif event == "GUILD_ROSTER_UPDATE" then
             RefreshGuildMembers()
             if DB:Settings().syncEnabled and DB:Settings().syncGuild and IsTransportAllowed("GUILD") then

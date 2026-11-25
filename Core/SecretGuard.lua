@@ -105,17 +105,57 @@ function Guard.IsUnitIdentitySecret(unit)
 end
 
 function Guard.InCommLockdown()
-    if _G.C_ChatInfo then
-        if _G.C_ChatInfo.InChatMessagingLockdown then
-            local ok, locked = pcall(_G.C_ChatInfo.InChatMessagingLockdown)
-            if ok and Guard.SafeBool(locked) == true then return true end
-        end
-        if _G.C_ChatInfo.AreOutgoingAddonChatMessagesRestricted then
-            local ok, restricted = pcall(_G.C_ChatInfo.AreOutgoingAddonChatMessagesRestricted)
-            if ok and Guard.SafeBool(restricted) == true then return true end
-        end
+    if _G.C_ChatInfo and _G.C_ChatInfo.InChatMessagingLockdown then
+        local ok, locked = pcall(_G.C_ChatInfo.InChatMessagingLockdown)
+        if ok and Guard.SafeBool(locked) == true then return true end
     end
     return false
+end
+
+local RESTRICTION_NAMES = { "Map", "Chat", "Combat", "Encounter", "ChallengeMode", "PvPMatch" }
+
+function Guard.GetLockdownDiagnostics()
+    local diag = {
+        inChatLockdown = "n/a",
+        outgoingRestricted = "n/a",
+        restrictions = {},
+        instanceName = "",
+        instanceType = "none",
+    }
+    if _G.C_ChatInfo then
+        if _G.C_ChatInfo.InChatMessagingLockdown then
+            local ok, v = pcall(_G.C_ChatInfo.InChatMessagingLockdown)
+            local b = ok and Guard.SafeBool(v)
+            if b ~= nil then diag.inChatLockdown = b end
+        end
+        if _G.C_ChatInfo.AreOutgoingAddonChatMessagesRestricted then
+            local ok, v = pcall(_G.C_ChatInfo.AreOutgoingAddonChatMessagesRestricted)
+            local b = ok and Guard.SafeBool(v)
+            if b ~= nil then diag.outgoingRestricted = b end
+        end
+    end
+    local enumTbl = _G.Enum and _G.Enum.AddOnRestrictionType
+    local ra = _G.C_RestrictedActions
+    if enumTbl and ra and ra.IsAddOnRestrictionActive then
+        for i = 1, #RESTRICTION_NAMES do
+            local rName = RESTRICTION_NAMES[i]
+            local code = enumTbl[rName]
+            if code ~= nil then
+                local ok, active = pcall(ra.IsAddOnRestrictionActive, code)
+                if ok and Guard.SafeBool(active) == true then
+                    diag.restrictions[#diag.restrictions + 1] = rName
+                end
+            end
+        end
+    end
+    if _G.GetInstanceInfo then
+        local ok, iName, iType = pcall(_G.GetInstanceInfo)
+        if ok then
+            diag.instanceName = Guard.SafeString(iName) or ""
+            diag.instanceType = Guard.SafeString(iType) or "none"
+        end
+    end
+    return diag
 end
 
 function Guard.GetPlayerRealmNormalized()
