@@ -1,0 +1,32 @@
+## Interface: 120105, 16001
+## Title: |cffff4d4dTHE|r |cff0cd29fLIST|r
+## Notes: Personal and synced player list.
+## Author: darkfire0
+## Version: 1.1.2
+## SavedVariables: TheListDB
+## OptionalDeps: EllesmereUI, EllesmereUIGroupFinder, EllesmereUIOptions
+## IconTexture: Interface\Icons\INV_Misc_Book_11
+## AddonCompartmentFunc: TheList_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: TheList_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: TheList_OnAddonCompartmentLeave
+
+Libs\LibStub\LibStub.lua
+Libs\LibSerialize\LibSerialize.lua
+Libs\LibDeflate\LibDeflate.lua
+Libs\ChatThrottleLib\ChatThrottleLib.lua
+
+Core\Namespace.lua
+Core\SecretGuard.lua
+Core\DB.lua
+Core\Sync.lua
+
+Modules\Detector.lua
+Modules\Hooks.lua
+
+UI\Theme.lua
+UI\AlertBanner.lua
+UI\QuickModal.lua
+UI\PluginPages.lua
+UI\StandaloneUI.lua
+
+Init.lua
