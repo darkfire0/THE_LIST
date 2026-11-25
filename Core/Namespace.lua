@@ -4,12 +4,13 @@ _G.THE_LIST = ns
 
 ns.ADDON_NAME  = ADDON_NAME or "THE_LIST"
 ns.DISPLAY_NAME = "THE LIST"
-ns.VERSION     = "1.1.2"
+ns.VERSION     = "1.1.3"
 ns.COMM_PREFIX = "THELIST1"
 ns.PROTOCOL_V  = 1
 
 local function DetectClientFlavor()
-    local toc = (_G.GetBuildInfo and tonumber(select(4, _G.GetBuildInfo()))) or 0
+    local rawToc = _G.GetBuildInfo and select(4, _G.GetBuildInfo())
+    local toc = tonumber(rawToc) or 0
     local proj = _G.WOW_PROJECT_ID
     local isClassicExplicit = (_G.WOW_PROJECT_CLASSIC ~= nil and proj == _G.WOW_PROJECT_CLASSIC)
     local isForever = (not isClassicExplicit)
