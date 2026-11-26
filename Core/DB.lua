@@ -42,7 +42,7 @@ function DB:Init()
     end
     local root = _G.TheListDB
     local hadExistingDB = (root.schemaVersion ~= nil) or (type(root.settings) == "table" and next(root.settings) ~= nil)
-    root.schemaVersion = tonumber(root.schemaVersion) or (hadExistingDB and 1 or 2)
+    root.schemaVersion = tonumber(root.schemaVersion) or (hadExistingDB and 1 or 3)
     if type(root.authorID) ~= "string" or root.authorID == "" then
         root.authorID = GenerateAuthorID()
     end
@@ -63,6 +63,11 @@ function DB:Init()
             root.settings.blackSound = "eui_siren"
         end
         root.schemaVersion = 2
+    end
+    if root.schemaVersion < 3 then
+        root.settings.syncRelay = false
+        root.settings.trustMode = nil
+        root.schemaVersion = 3
     end
     self:RefreshMyLabel()
     self:PruneOldTombstones()

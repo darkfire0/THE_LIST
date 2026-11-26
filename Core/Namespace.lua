@@ -4,7 +4,7 @@ _G.THE_LIST = ns
 
 ns.ADDON_NAME  = ADDON_NAME or "THE_LIST"
 ns.DISPLAY_NAME = "THE LIST"
-ns.VERSION     = "1.2.0"
+ns.VERSION     = "1.2.1"
 ns.COMM_PREFIX = "THELIST1"
 ns.PROTOCOL_V  = 1
 

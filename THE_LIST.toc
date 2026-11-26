@@ -2,7 +2,7 @@
 ## Title: |cffff4d4dTHE|r |cff0cd29fLIST|r
 ## Notes: Personal and synced player list.
 ## Author: darkfire0
-## Version: 1.2.0
+## Version: 1.2.1
 ## SavedVariables: TheListDB
 ## OptionalDeps: EllesmereUI, EllesmereUIGroupFinder, EllesmereUIOptions
 ## IconTexture: Interface\Icons\INV_Misc_Book_11
