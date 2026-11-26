@@ -4,7 +4,7 @@ _G.THE_LIST = ns
 
 ns.ADDON_NAME  = ADDON_NAME or "THE_LIST"
 ns.DISPLAY_NAME = "THE LIST"
-ns.VERSION     = "1.1.4"
+ns.VERSION     = "1.2.0"
 ns.COMM_PREFIX = "THELIST1"
 ns.PROTOCOL_V  = 1
 
@@ -130,8 +130,7 @@ ns.DEFAULTS = {
         syncBNet             = true,
         syncGuild            = true,
         syncParty            = false,
-        syncRelay            = true,
-        trustMode            = "friends_and_guild", -- "friends_and_guild" | "bnet_only" | "guild_only"
+        syncRelay            = false,
         syncGreenEntries     = true,
         autoSyncOnLogin      = true,
 

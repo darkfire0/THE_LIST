@@ -37,6 +37,49 @@ local function GetMatchSummaryLines(match, headerLabel)
         left = (headerLabel and (headerLabel .. " ") or "") .. tagColor .. "THE LIST: " .. listWord .. "|r",
         right = "",
     }
+
+    local groups = DB.BuildDedupedTooltipGroups and DB:BuildDedupedTooltipGroups(match) or nil
+    if groups and #groups > 0 then
+        for i = 1, #groups do
+            local g = groups[i]
+            local authors = {}
+            if g.hasYou then
+                authors[#authors + 1] = "|cffffffffYou|r"
+            end
+            local pCol = (g.listType == ns.LIST_GREEN) and goodHex or "|cffff7a7a"
+            local peerNames = g.peerNames or {}
+            local showLimit = math.min(2, #peerNames)
+            for j = 1, showLimit do
+                authors[#authors + 1] = pCol .. tostring(peerNames[j]) .. "|r"
+            end
+            if #peerNames > showLimit then
+                authors[#authors + 1] = pCol .. "(+" .. tostring(#peerNames - showLimit) .. ")|r"
+            end
+
+            local sev = (g.listType == ns.LIST_BLACK) and (" [" .. (ns.SEVERITY_LABELS[g.severity or 2] or "Warn") .. "]") or ""
+            local text = table.concat(authors, ", ") .. " (" .. (g.category or "Other") .. sev .. ")"
+            local note = g.note or ""
+            if g.hasYou and g.privateNote and g.privateNote ~= "" then
+                if note ~= "" then
+                    note = note .. " [Private: " .. g.privateNote .. "]"
+                else
+                    note = "[Private: " .. g.privateNote .. "]"
+                end
+            end
+            if note ~= "" then
+                text = text .. ": " .. note
+            end
+            lines[#lines + 1] = {
+                left = text,
+                wrap = true,
+                r = g.hasYou and 0.92 or 0.85,
+                g = g.hasYou and 0.92 or 0.85,
+                b = g.hasYou and 0.92 or 0.85,
+            }
+        end
+        return lines
+    end
+
     if match.personal then
         local e = match.personal
         local sev = (e.listType == ns.LIST_BLACK) and (" [" .. (ns.SEVERITY_LABELS[e.severity or 2] or "Warn") .. "]") or ""
@@ -782,7 +825,7 @@ local function InstallContextMenus()
             local myKey = Guard.GetPlayerKey()
             if not key or (myKey and key == myKey) then return end
 
-            local match = DB:Lookup(targetName, guid, false)
+            local match = DB:Lookup(targetName, guid, true)
             local personal = match and match.personal
             local goodHex = (ns.Theme and ns.Theme.GetGoodHex and ns.Theme:GetGoodHex()) or "|cff3ec8ec"
 
@@ -804,7 +847,29 @@ local function InstallContextMenus()
                     ns.Print("Removed " .. personal.name .. " from THE LIST.")
                 end)
             else
-                local sub = rootDescription:CreateButton("|cffff4d4dTHE|r " .. goodHex .. "LIST|r")
+                local subTitle = "|cffff4d4dTHE|r " .. goodHex .. "LIST|r"
+                if match and match.primary then
+                    local badge = (match.effectiveType == ns.LIST_GREEN)
+                        and (goodHex .. "Peer Good|r")
+                        or "|cffff4d4dPeer Bad|r"
+                    subTitle = subTitle .. " (" .. badge .. ")"
+                end
+                local sub = rootDescription:CreateButton(subTitle)
+                if match and match.primary then
+                    local firstPeer = match.peers and match.peers[1]
+                    local peerShort = DB.GetShortPeerLabel
+                        and DB:GetShortPeerLabel(firstPeer and firstPeer.authorID, match.primarySource)
+                        or tostring(match.primarySource or "Peer")
+                    sub:CreateButton("Save " .. tostring(peerShort) .. "'s Entry (Local)", function()
+                        DB:AdoptPeerEntry(match.primary, {
+                            guid = guid,
+                            class = class,
+                            listType = match.effectiveType,
+                        })
+                        ns.Print("Saved " .. tostring(targetName) .. " to your personal list (local only).")
+                    end)
+                    sub:CreateDivider()
+                end
                 sub:CreateButton("|cffff4d4dAdd to Bad Bois...|r", function()
                     if ns.QuickModal then
                         ns.QuickModal:Open({

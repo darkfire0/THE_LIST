@@ -63,6 +63,39 @@ function Guard.SafeString(val)
     return val
 end
 
+Guard.VALID_CLASSES = {
+    WARRIOR = true,
+    PALADIN = true,
+    HUNTER = true,
+    ROGUE = true,
+    PRIEST = true,
+    DEATHKNIGHT = true,
+    SHAMAN = true,
+    MAGE = true,
+    WARLOCK = true,
+    MONK = true,
+    DRUID = true,
+    DEMONHUNTER = true,
+    EVOKER = true,
+}
+
+function Guard.SafeClassToken(val)
+    local s = Guard.SafeString(val)
+    if not s or not Guard.VALID_CLASSES[s] then return nil end
+    return s
+end
+
+function Guard.SafePlayerGuid(val)
+    local s = Guard.SafeString(val)
+    if not s or #s > 48 or not s:match("^[%w%-]+$") then
+        return nil
+    end
+    if not Guard.IsForever() and s:sub(1, 7) ~= "Player-" then
+        return nil
+    end
+    return s
+end
+
 function Guard.SanitizePeerText(str, maxLen)
     if type(str) ~= "string" or Guard.IsSecret(str) then return "" end
     local s = str
@@ -405,6 +438,40 @@ function Guard.GetClassRGB(classToken)
         end
     end
     return 0.90, 0.90, 0.90
+end
+
+function Guard.FormatPlayerNameColored(rawName, cr, cg, cb)
+    local ri = math.max(0, math.min(255, math.floor((cr or 0.90) * 255 + 0.5)))
+    local gi = math.max(0, math.min(255, math.floor((cg or 0.90) * 255 + 0.5)))
+    local bi = math.max(0, math.min(255, math.floor((cb or 0.90) * 255 + 0.5)))
+    local hex = string.format("|cff%02x%02x%02x", ri, gi, bi)
+    local text = tostring(rawName or "?")
+    if not Guard.IsForever() and type(rawName) == "string" then
+        local base, realm = rawName:match("^([^%-]+)(%-.+)$")
+        if base and realm then
+            return hex .. base .. "|r|cff7a7a7a" .. realm .. "|r"
+        end
+    end
+    return hex .. text .. "|r"
+end
+
+function Guard.GetCurrentInstanceContext()
+    if not _G.GetInstanceInfo then return "" end
+    local ok, iName, iType = pcall(_G.GetInstanceInfo)
+    if not ok then return "" end
+    local instName = Guard.SafeString(iName)
+    local instType = Guard.SafeString(iType)
+    if not instName or not instType or instType == "none" then
+        return ""
+    end
+    if instType == "party" and _G.C_ChallengeMode and _G.C_ChallengeMode.GetActiveKeystoneInfo then
+        local okKey, level = pcall(_G.C_ChallengeMode.GetActiveKeystoneInfo)
+        level = okKey and Guard.SafeNumber(level) or nil
+        if level and level > 0 then
+            return instName .. " +" .. tostring(level)
+        end
+    end
+    return instName
 end
 
 local THELIST_SOUND_PATHS = {

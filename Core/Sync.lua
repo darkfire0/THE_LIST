@@ -14,6 +14,10 @@ local CHUNK_LIMIT = 230
 local MAX_CHUNKS = 40
 local MAX_DEFERRED_CHUNKS = 60
 local HANDSHAKE_COOLDOWN = 20
+local MAX_INBOUND_BUFFERS = 32
+local MAX_DECOMPRESSED_BYTES = 131072
+local MAX_ITEMS_PER_DELTA = 100
+local WHISPER_ALLOW_WINDOW = 180
 
 local onlinePeers = {}     -- [authorID] = { authorLabel, via, target, gameAccountID, lastHelloAt }
 local helloReplyAt = {}    -- [authorID] = lastHelloReplyTime
@@ -25,6 +29,8 @@ local inboundBuffers = {}  -- [bufKey] = { total, received, parts, ts }
 local deferredQueue = {}   -- queued sends while InChatMessagingLockdown() is active
 local deferredHelloPending = false
 local guildMembers = {}
+local wowFriends = {}
+local explicitWhisperTargets = {}
 local lastGuildHelloReplyAt = 0
 local manualSyncAt = 0
 local lastSendErrorNoticeAt = 0
@@ -32,6 +38,10 @@ local versionNoticeShown = false
 local msgCounter = 0
 local commFrame
 local initialized = false
+
+local function IsFiniteRev(n)
+    return type(n) == "number" and n == n and n >= 0 and n < 1e12
+end
 
 local stats = {
     prefixRegistered = false,
@@ -90,7 +100,7 @@ local function TryDecode(encoded, decodeFn)
     local compressed = decodeFn(LibDeflate, encoded)
     if not compressed then return nil end
     local serialized = LibDeflate:DecompressDeflate(compressed)
-    if not serialized then return nil end
+    if not serialized or #serialized > MAX_DECOMPRESSED_BYTES then return nil end
     local ok, pkt = LibSerialize:Deserialize(serialized)
     if not ok or type(pkt) ~= "table" then return nil end
     return pkt
@@ -508,10 +518,12 @@ function Sync:CollectBNetWoWAccounts()
         if charLabel and realmName and not Guard.IsForever() then
             charLabel = charLabel .. "-" .. (Guard.NormalizeRealm(realmName) or realmName)
         end
+        local charKey = charName and Guard.NormalizeNameRealm(charName, realmName) or nil
         local btag = acc and Guard.SafeString(acc.battleTag) or nil
         targets[#targets + 1] = {
             gameAccountID = gid,
             battleTag = btag,
+            charKey = charKey,
             label = btag or charLabel or ("BNet#" .. tostring(gid)),
         }
     end
@@ -552,23 +564,108 @@ local function RefreshGuildMembers()
     end
 end
 
+local function RefreshWoWFriends()
+    wipe(wowFriends)
+    if _G.C_FriendList and _G.C_FriendList.GetNumFriends and _G.C_FriendList.GetFriendInfoByIndex then
+        local okNum, total = pcall(_G.C_FriendList.GetNumFriends)
+        total = okNum and Guard.SafeNumber(total) or 0
+        for i = 1, total do
+            local okInfo, info = pcall(_G.C_FriendList.GetFriendInfoByIndex, i)
+            if okInfo and Guard.CanReadTable(info) then
+                local key = Guard.NormalizeNameRealm(Guard.SafeString(info.name))
+                if key then wowFriends[key] = true end
+            end
+        end
+    elseif _G.GetNumFriends and _G.GetFriendInfo then
+        local okNum, total = pcall(_G.GetNumFriends)
+        total = okNum and Guard.SafeNumber(total) or 0
+        for i = 1, total do
+            local okInfo, name = pcall(_G.GetFriendInfo, i)
+            if okInfo then
+                local key = Guard.NormalizeNameRealm(Guard.SafeString(name))
+                if key then wowFriends[key] = true end
+            end
+        end
+    end
+end
+
+local function IsOnlineBNetChar(senderKey)
+    if not senderKey then return false end
+    local accounts = Sync:CollectBNetWoWAccounts()
+    for i = 1, #accounts do
+        if accounts[i].charKey == senderKey then
+            return true
+        end
+    end
+    return false
+end
+
+local function IsInCurrentGroup(senderKey)
+    if not senderKey or not (_G.IsInGroup and _G.IsInGroup()) then return false end
+    local inRaid = _G.IsInRaid and _G.IsInRaid()
+    local count = _G.GetNumGroupMembers and _G.GetNumGroupMembers() or 0
+    local loopEnd = inRaid and count or math.max(0, count - 1)
+    for i = 1, loopEnd do
+        local unit = inRaid and ("raid" .. i) or ("party" .. i)
+        local info = Guard.SafeUnitInfo(unit, true)
+        if info and info.key == senderKey then
+            return true
+        end
+    end
+    return false
+end
+
+local function PruneExplicitWhispers()
+    local now = time()
+    for k, ts in pairs(explicitWhisperTargets) do
+        if (now - ts) > WHISPER_ALLOW_WINDOW then
+            explicitWhisperTargets[k] = nil
+        end
+    end
+end
+
 local function IsTransportAllowed(transport, senderKey)
-    local mode = DB:Settings().trustMode or "friends_and_guild"
-    if mode == "bnet_only" then
-        return transport == "BNET"
-    elseif mode == "guild_only" then
-        if transport == "GUILD" then return true end
-        if transport == "WHISPER" and _G.IsInGuild and _G.IsInGuild() then
+    local s = DB:Settings()
+    if transport == "BNET" then
+        return s.syncBNet == true
+    elseif transport == "GUILD" then
+        return s.syncGuild == true
+    elseif transport == "PARTY" or transport == "RAID" or transport == "INSTANCE_CHAT" then
+        return s.syncParty == true
+    elseif transport == "WHISPER" then
+        if senderKey == nil then return false end
+        local key = Guard.NormalizeNameRealm(senderKey)
+        if not key then return false end
+        local explicitTs = explicitWhisperTargets[key]
+        if explicitTs and (time() - explicitTs) <= WHISPER_ALLOW_WINDOW then
+            return true
+        end
+        if s.syncGuild and _G.IsInGuild and _G.IsInGuild() then
             if not next(guildMembers) then
                 RefreshGuildMembers()
             end
-            if not next(guildMembers) then return true end
-            local key = Guard.NormalizeNameRealm(senderKey)
-            return key ~= nil and guildMembers[key] == true
+            if guildMembers[key] == true then
+                return true
+            end
+        end
+        if s.syncBNet then
+            if not next(wowFriends) then
+                RefreshWoWFriends()
+            end
+            if wowFriends[key] == true or IsOnlineBNetChar(key) then
+                return true
+            end
+        end
+        if s.syncParty and IsInCurrentGroup(key) then
+            return true
         end
         return false
     end
-    return true
+    return false
+end
+
+function Sync:IsTransportAllowed(transport, senderKey)
+    return IsTransportAllowed(transport, senderKey)
 end
 
 local function ResolveReplyRoute(transport, gameAccountID, whisperTarget)
@@ -583,7 +680,8 @@ end
 
 local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDisplay)
     local root = DB:Root()
-    if not root or type(pkt.a) ~= "string" or pkt.a == "" or pkt.a == root.authorID then return end
+    if not root or type(pkt.a) ~= "string" or pkt.a == "" or #pkt.a > 64 or pkt.a == root.authorID then return end
+    if DB:IsPeerMuted(pkt.a) then return end
 
     if not IsTransportAllowed(transport, senderKey) then
         return
@@ -592,6 +690,8 @@ local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDispl
     stats.recvHello = stats.recvHello + 1
 
     local peerAuthorID = pkt.a
+    local rawPeerRev = tonumber(pkt.r)
+    local peerRev = (rawPeerRev ~= nil and IsFiniteRev(rawPeerRev)) and rawPeerRev or 0
     local cleanLabel = Guard.SanitizePeerText(pkt.l, 64)
     local peerLabel = (cleanLabel ~= "" and cleanLabel) or senderDisplay or senderKey or peerAuthorID
     local whisperTarget = (type(senderDisplay) == "string" and senderDisplay ~= "") and senderDisplay or senderKey
@@ -602,7 +702,7 @@ local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDispl
         target = whisperTarget,
         gameAccountID = gameAccountID,
         lastHelloAt = time(),
-        rev = tonumber(pkt.r) or 0,
+        rev = peerRev,
     }
 
     -- Ensure peer appears in SavedVariables even before entries exist
@@ -662,7 +762,7 @@ local function HandleHello(pkt, transport, senderKey, gameAccountID, senderDispl
     local now = time()
     local guildHelloReady = (replyTransport ~= "GUILD") or ((now - lastGuildHelloReplyAt) >= 15)
     local peerReplyReady = (now - (helloReplyAt[peerAuthorID] or 0)) >= 15
-    if canReplyTarget and (tonumber(pkt.r) or 0) > myKnownTheirRev and peerReplyReady and guildHelloReady then
+    if canReplyTarget and peerRev > myKnownTheirRev and peerReplyReady and guildHelloReady then
         helloReplyAt[peerAuthorID] = now
         if replyTransport == "GUILD" then
             lastGuildHelloReplyAt = now
@@ -676,7 +776,8 @@ end
 
 local function HandleDelta(pkt, transport, senderKey, gameAccountID, senderDisplay)
     local root = DB:Root()
-    if not root or type(pkt.a) ~= "string" or pkt.a == "" or pkt.a == root.authorID then return end
+    if not root or type(pkt.a) ~= "string" or pkt.a == "" or #pkt.a > 64 or pkt.a == root.authorID then return end
+    if DB:IsPeerMuted(pkt.a) or (type(pkt.s) == "string" and DB:IsPeerMuted(pkt.s)) then return end
 
     if not IsTransportAllowed(transport, senderKey) then
         return
@@ -686,6 +787,9 @@ local function HandleDelta(pkt, transport, senderKey, gameAccountID, senderDispl
     if pkt.s ~= pkt.a and not s.syncRelay then
         return
     end
+    if type(pkt.items) == "table" and #pkt.items > MAX_ITEMS_PER_DELTA then
+        return
+    end
 
     stats.recvDelta = stats.recvDelta + 1
 
@@ -693,8 +797,10 @@ local function HandleDelta(pkt, transport, senderKey, gameAccountID, senderDispl
     local applied, hasGap = DB:MergePeerDelta(pkt.a, Guard.SafeString(pkt.l), pkt.items, pkt.toRev, via, pkt.fromRev)
 
     local peerAuthorID = pkt.a
-    local numFrom = tonumber(pkt.fromRev)
-    local numTo = tonumber(pkt.toRev)
+    local rawFrom = tonumber(pkt.fromRev)
+    local rawTo = tonumber(pkt.toRev)
+    local numFrom = (rawFrom ~= nil and IsFiniteRev(rawFrom)) and rawFrom or nil
+    local numTo = (rawTo ~= nil and IsFiniteRev(rawTo)) and rawTo or nil
     local now = time()
 
     if hasGap and numFrom and numTo and numTo > numFrom then
@@ -782,6 +888,7 @@ local function OnIncomingRaw(transport, senderKey, gameAccountID, rawText, sende
 
     local s = DB:Settings()
     if not s.syncEnabled then return end
+    if not IsTransportAllowed(transport, senderKey) then return end
 
     local encoded = nil
     local tag = rawText:sub(1, 2)
@@ -797,6 +904,15 @@ local function OnIncomingRaw(transport, senderKey, gameAccountID, rawText, sende
         local bufKey = transport .. ":" .. tostring(senderKey or gameAccountID) .. ":" .. msgID
         local buf = inboundBuffers[bufKey]
         if not buf or buf.total ~= total then
+            if not buf then
+                local bufCount = 0
+                for _ in pairs(inboundBuffers) do
+                    bufCount = bufCount + 1
+                end
+                if bufCount >= MAX_INBOUND_BUFFERS then
+                    return
+                end
+            end
             buf = { total = total, received = 0, parts = {}, ts = time() }
             inboundBuffers[bufKey] = buf
         end
@@ -1002,14 +1118,16 @@ function Sync:SyncWithPlayer(rawName)
     if not s.syncEnabled then
         return { ok = false, reason = "disabled" }
     end
-    local _, display = Guard.NormalizeNameRealm(rawName)
-    if not display then
+    local targetKey, display = Guard.NormalizeNameRealm(rawName)
+    if not targetKey or not display then
         return { ok = false, reason = "invalid_target" }
     end
     local hello = BuildHelloPacket()
     if not hello then
         return { ok = false, reason = "not_initialized" }
     end
+    PruneExplicitWhispers()
+    explicitWhisperTargets[targetKey] = time()
     manualSyncAt = time()
     local ok, res = SendPacket("WHISPER", display, hello, true)
     if ok then
@@ -1101,9 +1219,9 @@ function Sync:PrintDebugStatus()
         or "none"
 
     ns.Print(string.format(
-        "Sync Debug: prefix=%s (%s), lockdown=%s, enabled=%s, trust=%s, BNet=%s, Guild=%s, Party=%s, Relay=%s, id=%s, rev=%d",
+        "Sync Debug: prefix=%s (%s), lockdown=%s, enabled=%s, BNet=%s, Guild=%s, Party=%s, Relay=%s, id=%s, rev=%d",
         tostring(stats.prefixRegistered), tostring(stats.prefixResult),
-        tostring(Guard.InCommLockdown()), tostring(s.syncEnabled), tostring(s.trustMode),
+        tostring(Guard.InCommLockdown()), tostring(s.syncEnabled),
         tostring(s.syncBNet), tostring(s.syncGuild), tostring(s.syncParty), tostring(s.syncRelay),
         tostring(root and root.authorID), tonumber(root and root.revision) or 0
     ))
@@ -1148,6 +1266,8 @@ function Sync:Init()
         Guard.SafeRegisterEvent(commFrame, "CHALLENGE_MODE_COMPLETED")
     end
     Guard.SafeRegisterEvent(commFrame, "GUILD_ROSTER_UPDATE")
+    Guard.SafeRegisterEvent(commFrame, "FRIENDLIST_UPDATE")
+    RefreshWoWFriends()
 
     local helloDebounce = false
     local function ScheduleHello()
@@ -1201,6 +1321,8 @@ function Sync:Init()
             if DB:Settings().syncEnabled and DB:Settings().syncGuild and IsTransportAllowed("GUILD") then
                 ScheduleHello()
             end
+        elseif event == "FRIENDLIST_UPDATE" then
+            RefreshWoWFriends()
         end
     end)
 

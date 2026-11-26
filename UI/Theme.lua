@@ -266,6 +266,92 @@ function Theme:HideTooltip()
     end
 end
 
+local function ApplyColorPrefix(text, color)
+    local t = tostring(text or "")
+    if type(color) ~= "table" then return t end
+    local r = color.r or color[1] or 1
+    local g = color.g or color[2] or 1
+    local b = color.b or color[3] or 1
+    local ri = math.max(0, math.min(255, math.floor(r * 255 + 0.5)))
+    local gi = math.max(0, math.min(255, math.floor(g * 255 + 0.5)))
+    local bi = math.max(0, math.min(255, math.floor(b * 255 + 0.5)))
+    return string.format("|cff%02x%02x%02x%s|r", ri, gi, bi, t)
+end
+
+local function BuildEUIContextItems(items)
+    local out = {}
+    for i = 1, #items do
+        local item = items[i]
+        if item == "---" then
+            out[#out + 1] = "---"
+        elseif type(item) == "table" then
+            local disabledFn = item.isDisabled
+            if item.isTitle and not disabledFn then
+                disabledFn = function() return true end
+            end
+            local entry = {
+                text = ApplyColorPrefix(item.text, item.color),
+                noLoc = true,
+                onClick = item.onClick,
+                isDisabled = disabledFn,
+                isActive = item.isActive,
+                desc = item.desc,
+                tooltip = item.tooltip,
+            }
+            if type(item.children) == "table" then
+                entry.children = BuildEUIContextItems(item.children)
+            end
+            out[#out + 1] = entry
+        end
+    end
+    return out
+end
+
+local function PopulateBlizzardMenu(root, items)
+    for i = 1, #items do
+        local item = items[i]
+        if item == "---" then
+            if root.CreateDivider then root:CreateDivider() end
+        elseif type(item) == "table" then
+            local text = ApplyColorPrefix(item.text, item.color)
+            if item.isTitle and root.CreateTitle then
+                root:CreateTitle(text)
+            elseif type(item.children) == "table" and root.CreateButton then
+                local sub = root:CreateButton(text)
+                PopulateBlizzardMenu(sub, item.children)
+            elseif root.CreateButton then
+                local disabled = item.isDisabled and item.isDisabled()
+                local btn = root:CreateButton(text, function()
+                    if not disabled and item.onClick then
+                        item.onClick()
+                    end
+                end)
+                if disabled and btn and btn.SetEnabled then
+                    btn:SetEnabled(false)
+                end
+            end
+        end
+    end
+end
+
+function Theme:ShowContextMenu(anchor, items, opts)
+    if type(items) ~= "table" or #items == 0 then return false end
+    local eui = _G.EllesmereUI
+    if eui and eui.ShowContextMenu then
+        local euiItems = BuildEUIContextItems(items)
+        local ok = pcall(eui.ShowContextMenu, anchor, euiItems, opts)
+        if ok then return true end
+    end
+    if _G.MenuUtil and _G.MenuUtil.CreateContextMenu then
+        local owner = anchor or _G.UIParent
+        local ok = pcall(_G.MenuUtil.CreateContextMenu, owner, function(_, root)
+            PopulateBlizzardMenu(root, items)
+        end)
+        if ok then return true end
+    end
+    return false
+end
+
 local localEscapeFrames = setmetatable({}, { __mode = "k" })
 local localEscapeCombatFrame = nil
 

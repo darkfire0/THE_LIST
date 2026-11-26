@@ -20,6 +20,7 @@ local state = {
     nativeIgnore = false,
     guid = nil,
     class = nil,
+    context = nil,
     editingKey = nil,
 }
 
@@ -387,11 +388,7 @@ local function EnsureModalBuilt()
             ns.Print(Guard.IsForever() and "Please enter a valid player name." or "Please enter a valid Player-Realm name.")
             return
         end
-        local ctx = ""
-        if GetInstanceInfo then
-            local z, itype = GetInstanceInfo()
-            if itype and itype ~= "none" and Guard.SafeString(z) then ctx = z end
-        end
+        local ctx = Guard.GetCurrentInstanceContext and Guard.GetCurrentInstanceContext() or ""
         local prevKey = state.editingKey
         DB:AddOrUpdatePersonal({
             name = rawName,
@@ -404,7 +401,7 @@ local function EnsureModalBuilt()
             privateNote = ui.privBox:GetText() or "",
             share = state.share,
             nativeIgnore = (state.listType == ns.LIST_BLACK) and state.nativeIgnore or false,
-            context = (ctx ~= "" and ctx or nil),
+            context = (ctx ~= "" and ctx) or state.context or nil,
         })
         if prevKey and prevKey ~= key then
             DB:RemovePersonal(prevKey)
@@ -427,10 +424,11 @@ function Modal:Open(opts)
 
     state.guid = opts.guid or (existing and existing.guid)
     state.class = opts.class or (existing and existing.class)
+    state.context = (not existing) and opts.context or nil
     state.editingKey = existing and existing.key or nil
     state.listType = (existing and existing.listType) or opts.listType or ns.LIST_BLACK
-    state.category = (existing and existing.category) or ((state.listType == ns.LIST_GREEN) and "Reliable" or "Leaver")
-    state.severity = (existing and existing.severity) or 2
+    state.category = (existing and existing.category) or opts.category or ((state.listType == ns.LIST_GREEN) and "Reliable" or "Leaver")
+    state.severity = (existing and existing.severity) or opts.severity or 2
     if existing then
         state.share = (existing.share ~= false)
     elseif opts.share ~= nil then
@@ -441,7 +439,7 @@ function Modal:Open(opts)
     state.nativeIgnore = (existing and existing.nativeIgnore == true) or false
 
     ui.nameBox:SetText((existing and existing.name) or opts.name or "")
-    ui.sharedBox:SetText((existing and existing.sharedNote) or "")
+    ui.sharedBox:SetText((existing and existing.sharedNote) or ((not existing) and opts.sharedNote) or "")
     ui.privBox:SetText((existing and existing.privateNote) or "")
     ui.title:SetText(existing and "EDIT LIST ENTRY" or "YOU JUST MADE THE LIST!")
 

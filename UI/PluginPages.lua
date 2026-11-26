@@ -24,23 +24,6 @@ local SEVERITY_COLOR_LABELS = {
     [3] = "|cffff4d4dHard Avoid|r",
 }
 
-local function MakeDefaultForm(listType)
-    local isGreen = (listType == ns.LIST_GREEN)
-    return {
-        name = "",
-        guid = nil,
-        class = nil,
-        category = isGreen and "Reliable" or "Leaver",
-        severity = 2,
-        sharedNote = "",
-        privateNote = "",
-        share = true,
-        nativeIgnore = false,
-        editingKey = nil,
-        editingName = nil,
-    }
-end
-
 local uiState = {
     search = "",
     sourceFilter = "all",   -- "all" | "mine" | "peers"
@@ -54,45 +37,17 @@ local uiState = {
     headerRefreshByPage = {},
     summaryUpdaterByPage = {},
     lastShownCountByPage = {},
-    forms = {
-        [ns.LIST_BLACK] = MakeDefaultForm(ns.LIST_BLACK),
-        [ns.LIST_GREEN] = MakeDefaultForm(ns.LIST_GREEN),
-    },
     rowPool = {},
     activeRows = {},
+    subRowPool = {},
+    activeSubRows = {},
+    expandedKeys = {},
     emptyFS = nil,
     peerRowPool = {},
     activePeerRows = {},
     peerEmptyFS = nil,
     unlockPlaceholder = nil,
 }
-
-local function ResetForm(listType)
-    local dst = uiState.forms[listType]
-    local fresh = MakeDefaultForm(listType)
-    if not dst then
-        uiState.forms[listType] = fresh
-        return
-    end
-    for k in pairs(dst) do dst[k] = nil end
-    for k, v in pairs(fresh) do dst[k] = v end
-end
-
-local function LoadEntryIntoForm(listType, entry)
-    local f = uiState.forms[listType]
-    if not (f and entry) then return end
-    f.name = entry.name or entry.key or ""
-    f.guid = entry.guid
-    f.class = entry.class
-    f.category = entry.category or ((listType == ns.LIST_GREEN) and "Reliable" or "Leaver")
-    f.severity = entry.severity or 2
-    f.sharedNote = entry.sharedNote or ""
-    f.privateNote = entry.privateNote or ""
-    f.share = (entry.share ~= false)
-    f.nativeIgnore = (entry.nativeIgnore == true)
-    f.editingKey = entry.key
-    f.editingName = entry.name or entry.key
-end
 
 local function IsPluginShown()
     local eui = _G.EllesmereUI
@@ -152,74 +107,18 @@ local function MakeEUIButton(parent, text, w, h, fontSize, onClick, tint, toolti
     return btn
 end
 
-local function MakeEUICheckbox(parent, labelText, tooltipText, getVal, setVal)
-    local eui = _G.EllesmereUI
-    local btn = CreateFrame("Button", nil, parent)
-    btn:SetHeight(28)
-
-    local box, _, _, cbApply
-    if eui and eui.BuildCheckboxControl then
-        box, _, _, cbApply = eui.BuildCheckboxControl(btn, btn:GetFrameLevel() + 1)
-    else
-        box = CreateFrame("Frame", nil, btn)
-        box:SetSize(18, 18)
-        local bbg = Theme:SolidTex(box, "BACKGROUND", 0.08, 0.07, 0.06, 1)
-        bbg:SetAllPoints()
-        local bbrd = Theme:MakeBorder(box, 1, 1, 1, 0.22, bbg)
-        local ar, ag, ab = Theme:GetAccent()
-        local chk = Theme:SolidTex(box, "ARTWORK", ar, ag, ab, 1)
-        chk:SetPoint("TOPLEFT", box, "TOPLEFT", 3, -3)
-        chk:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -3, 3)
-        cbApply = function(on, hover)
-            chk:SetShown(on)
-            bbrd:SetColor(on and ar or 1, on and ag or 1, on and ab or 1, on and 0.7 or (hover and 0.45 or 0.22))
-        end
-    end
-    box:SetPoint("LEFT", btn, "LEFT", 0, 0)
-
-    local lbl = Theme:MakeFont(btn, 12, "", 1, 1, 1, 0.85)
-    lbl:SetPoint("LEFT", box, "RIGHT", 7, 0)
-    lbl:SetText(labelText)
-    btn:SetWidth(math.ceil(18 + 7 + (lbl:GetStringWidth() or 48) + 4))
-
-    local hovering = false
-    local function Refresh()
-        local on = getVal() == true
-        cbApply(on, hovering)
-        if on then
-            lbl:SetTextColor(1, 1, 1, 0.96)
-        else
-            lbl:SetTextColor(1, 1, 1, hovering and 0.92 or 0.68)
-        end
-    end
-    Refresh()
-
-    btn:SetScript("OnClick", function()
-        setVal(not getVal())
-        Refresh()
-    end)
-    btn:SetScript("OnEnter", function(self)
-        hovering = true
-        Refresh()
-        if tooltipText then
-            Theme:ShowTooltip(self, tooltipText)
-        end
-    end)
-    btn:SetScript("OnLeave", function()
-        hovering = false
-        Refresh()
-        Theme:HideTooltip()
-    end)
-
-    return btn, Refresh
-end
-
 local function HidePooledRows()
     for i = 1, #uiState.activeRows do
         local r = uiState.activeRows[i]
         if r._hoverBg then r._hoverBg:Hide() end
         r:Hide()
         uiState.activeRows[i] = nil
+    end
+    for i = 1, #uiState.activeSubRows do
+        local sr = uiState.activeSubRows[i]
+        if sr._hoverBg then sr._hoverBg:Hide() end
+        sr:Hide()
+        uiState.activeSubRows[i] = nil
     end
     if uiState.emptyFS then uiState.emptyFS:Hide() end
 end
@@ -251,8 +150,278 @@ local function SetRowTextRightBound(row, rightPad)
     row._noteFS:SetPoint("RIGHT", row, "RIGHT", rightPad, 0)
 end
 
+local function SetRowHovered(row, hovered)
+    if not row then return end
+    if row._hoverBg then row._hoverBg:SetShown(hovered) end
+
+    if row._mode == "entry" then
+        if hovered then
+            if row._timeFS then row._timeFS:Hide() end
+            if row._btn1 then row._btn1:SetShown(row._wantBtn1 == true) end
+            if row._btn2 then row._btn2:SetShown(row._wantBtn2 == true) end
+            if row._btn3 then row._btn3:SetShown(row._wantBtn3 == true) end
+            SetRowTextRightBound(row, row._hoverRightPad or -156)
+        else
+            if row._timeFS then row._timeFS:Show() end
+            if row._btn1 then row._btn1:Hide() end
+            if row._btn2 then row._btn2:Hide() end
+            if row._btn3 then row._btn3:Hide() end
+            row._metaFS:ClearAllPoints()
+            row._metaFS:SetPoint("LEFT", row._nameFS, "RIGHT", 10, 0)
+            if row._timeFS then
+                row._metaFS:SetPoint("RIGHT", row._timeFS, "LEFT", -10, 0)
+            else
+                row._metaFS:SetPoint("RIGHT", row, "RIGHT", -14, 0)
+            end
+            row._noteFS:ClearAllPoints()
+            row._noteFS:SetPoint("TOPLEFT", row._nameFS, "BOTTOMLEFT", 0, -4)
+            row._noteFS:SetPoint("RIGHT", row, "RIGHT", -14, 0)
+        end
+    elseif row._mode == "subrow" then
+        if row._dismissBtn then row._dismissBtn:SetShown(hovered) end
+        local pad = hovered and -78 or -12
+        row._metaFS:ClearAllPoints()
+        row._metaFS:SetPoint("TOPLEFT", row, "TOPLEFT", 12, -4)
+        row._metaFS:SetPoint("RIGHT", row, "RIGHT", pad, 0)
+        row._noteFS:ClearAllPoints()
+        row._noteFS:SetPoint("TOPLEFT", row._metaFS, "BOTTOMLEFT", 0, -2)
+        row._noteFS:SetPoint("RIGHT", row, "RIGHT", pad, 0)
+    end
+end
+
+local function FormatAuthorsSummary(authors, useShort, limit)
+    if type(authors) ~= "table" or #authors == 0 then return "" end
+    local maxShow = limit and math.min(limit, #authors) or #authors
+    local names = {}
+    for i = 1, maxShow do
+        local a = authors[i]
+        if useShort then
+            names[#names + 1] = tostring(a.shortLabel or a.authorLabel or a.authorID or "?")
+        else
+            names[#names + 1] = tostring(a.authorLabel or a.shortLabel or a.authorID or "?")
+        end
+    end
+    local out = table.concat(names, ", ")
+    if limit and #authors > limit then
+        out = out .. " (+" .. tostring(#authors - limit) .. ")"
+    end
+    return out
+end
+
+local function CollectUniquePeers(rec)
+    local out, seen = {}, {}
+    local function AddList(list)
+        if type(list) ~= "table" then return end
+        for i = 1, #list do
+            local p = list[i]
+            if p and p.authorID and not seen[p.authorID] then
+                seen[p.authorID] = true
+                out[#out + 1] = p
+            end
+        end
+    end
+    AddList(rec.peers)
+    AddList(rec.conflictPeers)
+    return out
+end
+
+local RepaintEntriesList
+
+local function OpenEntryContextMenu(anchor, rec, opts, subGroup)
+    if not rec then return end
+    local entry = rec.primary or rec.entry
+    local items = {}
+    local br, bg, bb = Theme:GetBadRGB()
+
+    if subGroup then
+        local groupAuthors = subGroup.authors or {}
+        local authorIDs = {}
+        for i = 1, #groupAuthors do
+            if groupAuthors[i].authorID then
+                authorIDs[#authorIDs + 1] = groupAuthors[i].authorID
+            end
+        end
+        items[#items + 1] = {
+            text = "Dismiss This Note",
+            desc = "Hide locally without muting the peer.",
+            onClick = function()
+                DB:DismissPeerEntries(authorIDs, rec.key)
+            end,
+        }
+        if not rec.isMine then
+            items[#items + 1] = {
+                text = "Save This Note to My List (Local)",
+                onClick = function()
+                    DB:AdoptPeerEntry({
+                        key = rec.key,
+                        name = rec.name,
+                        guid = rec.guid,
+                        class = rec.class,
+                        listType = subGroup.listType or rec.listType,
+                        category = subGroup.category,
+                        severity = subGroup.severity,
+                        sharedNote = subGroup.sharedNote,
+                        context = subGroup.context,
+                    }, { guid = rec.guid, class = rec.class })
+                    ns.Print("Saved " .. tostring(rec.name or rec.key) .. " to your personal list (local only).")
+                end,
+            }
+        end
+        if #groupAuthors == 1 then
+            local p = groupAuthors[1]
+            items[#items + 1] = "---"
+            items[#items + 1] = {
+                text = "Mute Peer: " .. tostring(p.shortLabel or p.authorLabel),
+                color = { br, bg, bb },
+                onClick = function()
+                    DB:SetPeerTrust(p.authorID, "muted", true, p.authorLabel)
+                    if RepaintEntriesList then RepaintEntriesList() end
+                end,
+            }
+        elseif #groupAuthors > 1 then
+            local muteChildren = {}
+            for i = 1, #groupAuthors do
+                local p = groupAuthors[i]
+                muteChildren[#muteChildren + 1] = {
+                    text = tostring(p.shortLabel or p.authorLabel),
+                    color = { br, bg, bb },
+                    onClick = function()
+                        DB:SetPeerTrust(p.authorID, "muted", true, p.authorLabel)
+                        if RepaintEntriesList then RepaintEntriesList() end
+                    end,
+                }
+            end
+            items[#items + 1] = "---"
+            items[#items + 1] = { text = "Mute Peer", children = muteChildren }
+        end
+        Theme:ShowContextMenu(anchor, items, opts)
+        return
+    end
+
+    if rec.isMine and entry then
+        items[#items + 1] = {
+            text = "Edit Entry",
+            onClick = function()
+                if ns.QuickModal then
+                    ns.QuickModal:Open({
+                        name = entry.name,
+                        guid = rec.guid or entry.guid,
+                        class = rec.class or entry.class,
+                        entry = entry,
+                    })
+                end
+            end,
+        }
+        if rec.listType == ns.LIST_BLACK then
+            items[#items + 1] = {
+                text = entry.nativeIgnore and "Remove Blizzard /ignore" or "Add Blizzard /ignore",
+                onClick = function()
+                    DB:ToggleNativeIgnore(entry.key)
+                end,
+            }
+        end
+        items[#items + 1] = {
+            text = "Remove from Personal List",
+            color = { br, bg, bb },
+            onClick = function()
+                ConfirmRemoveEntry(entry)
+            end,
+        }
+    elseif entry then
+        items[#items + 1] = {
+            text = "Save to My List (Local)",
+            desc = "Copies locally without re-sharing until you edit it.",
+            onClick = function()
+                DB:AdoptPeerEntry(entry, { guid = rec.guid, class = rec.class, listType = rec.listType })
+                ns.Print("Saved " .. tostring(entry.name or rec.key) .. " to your personal list (local only).")
+            end,
+        }
+        items[#items + 1] = {
+            text = "Save & Edit...",
+            onClick = function()
+                if ns.QuickModal then
+                    ns.QuickModal:Open({
+                        name = entry.name or rec.name,
+                        guid = rec.guid,
+                        class = rec.class,
+                        listType = rec.listType,
+                        category = entry.category,
+                        severity = entry.severity,
+                        sharedNote = entry.sharedNote,
+                        context = entry.context,
+                        share = false,
+                    })
+                end
+            end,
+        }
+    end
+
+    if rec.hasExpandableDetails then
+        local expandKey = tostring(rec.listType) .. ":" .. tostring(rec.key)
+        local isExpanded = uiState.expandedKeys[expandKey] == true
+        items[#items + 1] = {
+            text = isExpanded and "Collapse Peer Notes" or "Expand Peer Notes",
+            onClick = function()
+                uiState.expandedKeys[expandKey] = not isExpanded and true or nil
+                if RepaintEntriesList then RepaintEntriesList() end
+            end,
+        }
+    end
+
+    local uniquePeers = CollectUniquePeers(rec)
+    if #uniquePeers > 0 then
+        items[#items + 1] = "---"
+        if #uniquePeers == 1 then
+            local p = uniquePeers[1]
+            items[#items + 1] = {
+                text = "Dismiss Entry from " .. tostring(p.shortLabel or p.authorLabel),
+                desc = "Hide this player from this peer without muting them.",
+                onClick = function()
+                    DB:DismissPeerEntry(p.authorID, rec.key)
+                end,
+            }
+            items[#items + 1] = {
+                text = "Mute Peer: " .. tostring(p.shortLabel or p.authorLabel),
+                color = { br, bg, bb },
+                onClick = function()
+                    DB:SetPeerTrust(p.authorID, "muted", true, p.authorLabel)
+                    if RepaintEntriesList then RepaintEntriesList() end
+                end,
+            }
+        else
+            local allIDs = {}
+            local muteChildren = {}
+            for i = 1, #uniquePeers do
+                local p = uniquePeers[i]
+                allIDs[#allIDs + 1] = p.authorID
+                muteChildren[#muteChildren + 1] = {
+                    text = tostring(p.shortLabel or p.authorLabel),
+                    color = { br, bg, bb },
+                    onClick = function()
+                        DB:SetPeerTrust(p.authorID, "muted", true, p.authorLabel)
+                        if RepaintEntriesList then RepaintEntriesList() end
+                    end,
+                }
+            end
+            items[#items + 1] = {
+                text = "Dismiss All Synced Notes for Player",
+                desc = "Hide all current peer entries for this player locally.",
+                onClick = function()
+                    DB:DismissPeerEntries(allIDs, rec.key)
+                end,
+            }
+            items[#items + 1] = {
+                text = "Mute Peer",
+                children = muteChildren,
+            }
+        end
+    end
+
+    Theme:ShowContextMenu(anchor, items, opts)
+end
+
 local function Row_OnEnter(self)
-    if self._hoverBg then self._hoverBg:Show() end
+    SetRowHovered(self, true)
     if self._mode == "recent" then
         local item = self._item
         if not item then return end
@@ -261,9 +430,30 @@ local function Row_OnEnter(self)
             tostring(self._ctx or "Last seen in group"),
             "Time: " .. tostring(self._seenTxt or "Unknown"),
         }, self._classRGB)
+    elseif self._mode == "subrow" then
+        local g = self._group
+        local rec = self._rec
+        if not (g and rec) then return end
+        local listWord = (g.listType == ns.LIST_GREEN) and "Good Boi" or "Bad Boi"
+        local lines = {
+            "Peers: " .. FormatAuthorsSummary(g.authors, false),
+            "List: " .. listWord .. "  (" .. tostring(g.category or "Other") .. ")",
+        }
+        if g.listType == ns.LIST_BLACK then
+            lines[#lines + 1] = "Severity: " .. (ns.SEVERITY_LABELS[g.severity or 2] or "Warn")
+        end
+        lines[#lines + 1] = "Updated: " .. Guard.FormatRelativeTime(g.updatedAt)
+        if g.sharedNote and g.sharedNote ~= "" then
+            lines[#lines + 1] = { text = "Note: " .. g.sharedNote, r = 0.95, g = 0.95, b = 0.95 }
+        end
+        if g.context and g.context ~= "" then
+            lines[#lines + 1] = { text = "Context: " .. g.context, r = 0.72, g = 0.72, b = 0.72 }
+        end
+        lines[#lines + 1] = { text = "Right-click for options", r = 0.55, g = 0.55, b = 0.55 }
+        Theme:ShowTooltip(self, rec.name or rec.key, lines, self._classRGB)
     elseif self._mode == "entry" then
         local rec = self._rec
-        local entry = rec and rec.entry
+        local entry = rec and (rec.primary or rec.entry)
         if not entry then return end
         local lines = {
             "Source: " .. (rec.isMine and "You" or tostring(rec.authorLabel)),
@@ -271,6 +461,9 @@ local function Row_OnEnter(self)
         }
         if self._listType == ns.LIST_BLACK then
             lines[#lines + 1] = "Severity: " .. (ns.SEVERITY_LABELS[entry.severity or 2] or "Warn")
+        end
+        if rec.isMine and entry.share == false then
+            lines[#lines + 1] = { text = "Visibility: Local only (not synced)", r = 0.72, g = 0.72, b = 0.72 }
         end
         if entry.sharedNote and entry.sharedNote ~= "" then
             lines[#lines + 1] = { text = "Shared Note: " .. entry.sharedNote, r = 0.95, g = 0.95, b = 0.95 }
@@ -281,16 +474,83 @@ local function Row_OnEnter(self)
         if entry.context and entry.context ~= "" then
             lines[#lines + 1] = { text = "Context: " .. entry.context, r = 0.7, g = 0.7, b = 0.7 }
         end
+
+        if rec.sameAsPrimaryPeers and #rec.sameAsPrimaryPeers > 0 then
+            lines[#lines + 1] = {
+                text = "Also listed identically by: " .. FormatAuthorsSummary(rec.sameAsPrimaryPeers, false),
+                r = 0.65, g = 0.80, b = 1.0,
+            }
+        end
+
+        if rec.distinctPeerGroups and #rec.distinctPeerGroups > 0 then
+            lines[#lines + 1] = { text = "Other Peer Notes:", r = 0.56, g = 0.72, b = 1.0 }
+            for i = 1, #rec.distinctPeerGroups do
+                local g = rec.distinctPeerGroups[i]
+                local auths = FormatAuthorsSummary(g.authors, false)
+                local sev = (g.listType == ns.LIST_BLACK) and (" [" .. (ns.SEVERITY_LABELS[g.severity or 2] or "Warn") .. "]") or ""
+                local note = (g.sharedNote ~= "" and g.sharedNote) or (g.context ~= "" and ("Context: " .. g.context)) or "(No note)"
+                lines[#lines + 1] = {
+                    text = string.format("%s (%s%s): %s", auths, g.category or "Other", sev, note),
+                    r = 0.88, g = 0.88, b = 0.92,
+                }
+            end
+        end
+
+        if rec.conflictGroups and #rec.conflictGroups > 0 then
+            local oppWord = (self._listType == ns.LIST_GREEN) and "Bad Boi" or "Good Boi"
+            local cr, cg, cb
+            if self._listType == ns.LIST_GREEN then
+                cr, cg, cb = Theme:GetBadRGB()
+            else
+                cr, cg, cb = Theme:GetGoodRGB()
+            end
+            lines[#lines + 1] = { text = "Conflicting Peer Entries (" .. oppWord .. "):", r = cr, g = cg, b = cb }
+            for i = 1, #rec.conflictGroups do
+                local g = rec.conflictGroups[i]
+                local auths = FormatAuthorsSummary(g.authors, false)
+                local sev = (g.listType == ns.LIST_BLACK) and (" [" .. (ns.SEVERITY_LABELS[g.severity or 2] or "Warn") .. "]") or ""
+                local note = (g.sharedNote ~= "" and g.sharedNote) or (g.context ~= "" and ("Context: " .. g.context)) or "(No note)"
+                lines[#lines + 1] = {
+                    text = string.format("%s (%s%s): %s", auths, g.category or "Other", sev, note),
+                    r = 0.92, g = 0.88, b = 0.88,
+                }
+            end
+        end
+
+        lines[#lines + 1] = {
+            text = rec.hasExpandableDetails and "Left-click to expand/collapse · Right-click for options" or "Right-click for options",
+            r = 0.55, g = 0.55, b = 0.55,
+        }
         Theme:ShowTooltip(self, entry.name or entry.key, lines, self._classRGB)
     end
 end
 
 local function Row_OnLeave(self)
-    if self._hoverBg then self._hoverBg:Hide() end
+    if not (self.IsMouseOver and self:IsMouseOver()) then
+        SetRowHovered(self, false)
+    end
     Theme:HideTooltip()
 end
 
+local function Row_OnMouseUp(self, button)
+    if self._mode == "entry" and self._rec then
+        local rec = self._rec
+        if button == "LeftButton" and rec.hasExpandableDetails then
+            local expandKey = tostring(rec.listType) .. ":" .. tostring(rec.key)
+            uiState.expandedKeys[expandKey] = not uiState.expandedKeys[expandKey] and true or nil
+            if RepaintEntriesList then RepaintEntriesList() end
+        elseif button == "RightButton" then
+            OpenEntryContextMenu(self, rec)
+        end
+    elseif self._mode == "subrow" and self._rec and self._group then
+        if button == "RightButton" then
+            OpenEntryContextMenu(self, self._rec, nil, self._group)
+        end
+    end
+end
+
 local function RowBtn_OnEnter(self)
+    if self._row then SetRowHovered(self._row, true) end
     local c = self._baseBrd
     self._bg:SetColorTexture(Theme.BG_BTN.r, Theme.BG_BTN.g, Theme.BG_BTN.b, 0.92)
     self._brd:SetColor(c[1], c[2], c[3], math.min(1, c[4] + 0.25))
@@ -301,6 +561,9 @@ local function RowBtn_OnEnter(self)
 end
 
 local function RowBtn_OnLeave(self)
+    if self._row and not (self._row.IsMouseOver and self._row:IsMouseOver()) then
+        SetRowHovered(self._row, false)
+    end
     local c = self._baseBrd
     self._bg:SetColorTexture(Theme.BG_BTN.r, Theme.BG_BTN.g, Theme.BG_BTN.b, 0.72)
     self._brd:SetColor(c[1], c[2], c[3], c[4])
@@ -310,60 +573,78 @@ local function RowBtn_OnLeave(self)
     end
 end
 
-local RepaintEntriesList
-
 local function RowBtn_OnClick(self)
     local row = self._row
     local act = self._action
     if not (row and act) then return end
 
-    if act == "recent_black" or act == "recent_green" then
+    if act == "recent_edit" then
+        local item = row._item
+        local personal = row._personalEntry
+        if personal and ns.QuickModal then
+            ns.QuickModal:Open({
+                name = personal.name,
+                guid = personal.guid or (item and item.guid),
+                class = personal.class or (item and item.class),
+                entry = personal,
+            })
+        end
+        return
+    elseif act == "recent_black" or act == "recent_green" then
         local item = row._item
         if item and ns.QuickModal then
             ns.QuickModal:Open({
                 name = item.name,
                 guid = item.guid,
                 class = item.class,
+                context = item.context,
                 listType = (act == "recent_green") and ns.LIST_GREEN or ns.LIST_BLACK,
             })
         end
         return
     end
 
+    if act == "dismiss_group" then
+        local rec = row._rec
+        local g = row._group
+        if rec and g and g.authors then
+            local ids = {}
+            for i = 1, #g.authors do
+                if g.authors[i].authorID then
+                    ids[#ids + 1] = g.authors[i].authorID
+                end
+            end
+            DB:DismissPeerEntries(ids, rec.key)
+        end
+        return
+    end
+
     local rec = row._rec
-    local entry = rec and rec.entry
+    local entry = rec and (rec.primary or rec.entry)
     if not entry then return end
 
     if act == "remove" then
         ConfirmRemoveEntry(entry)
     elseif act == "edit" then
-        local listType = row._listType
-        local pageName = row._pageName
-        LoadEntryIntoForm(listType, entry)
-        local refreshHdr = pageName and uiState.headerRefreshByPage[pageName]
-        if refreshHdr then
-            refreshHdr(true)
-        elseif ns.QuickModal then
-            ns.QuickModal:Open({ name = entry.name, guid = entry.guid, class = entry.class, entry = entry })
+        if ns.QuickModal then
+            ns.QuickModal:Open({
+                name = entry.name,
+                guid = rec.guid or entry.guid,
+                class = rec.class or entry.class,
+                entry = entry,
+            })
         end
     elseif act == "ignore" then
         DB:ToggleNativeIgnore(entry.key)
-    elseif act == "copy" then
-        DB:AddOrUpdatePersonal({
-            name = entry.name,
-            guid = entry.guid,
-            class = entry.class,
-            listType = entry.listType,
-            category = entry.category,
-            severity = entry.severity,
-            sharedNote = entry.sharedNote,
-            context = entry.context,
-            share = true,
+    elseif act == "adopt" then
+        DB:AdoptPeerEntry(entry, {
+            guid = rec.guid,
+            class = rec.class,
+            listType = row._listType,
         })
-        ns.Print("Copied " .. tostring(entry.name or entry.key) .. " to your personal list.")
-    elseif act == "mute" then
-        DB:SetPeerTrust(rec.authorID, "muted", true, rec.authorLabel)
-        if RepaintEntriesList then RepaintEntriesList() end
+        ns.Print("Saved " .. tostring(entry.name or rec.key) .. " to your personal list (local only).")
+    elseif act == "peer_menu" then
+        OpenEntryContextMenu(self, rec, { below = true })
     end
 end
 
@@ -413,6 +694,12 @@ local function GetOrCreateRow(parent, idx, rowW)
         metaFS:SetWordWrap(false)
         row._metaFS = metaFS
 
+        local timeFS = Theme:MakeFont(row, 11, "", 1, 1, 1, 0.44)
+        timeFS:SetPoint("TOPRIGHT", row, "TOPRIGHT", -14, -10)
+        timeFS:SetJustifyH("RIGHT")
+        timeFS:SetWordWrap(false)
+        row._timeFS = timeFS
+
         local noteFS = Theme:MakeFont(row, 12, "", 0.88, 0.88, 0.88, 0.86)
         noteFS:SetPoint("TOPLEFT", nameFS, "BOTTOMLEFT", 0, -4)
         noteFS:SetPoint("RIGHT", row, "RIGHT", -232, 0)
@@ -437,6 +724,7 @@ local function GetOrCreateRow(parent, idx, rowW)
 
         row:SetScript("OnEnter", Row_OnEnter)
         row:SetScript("OnLeave", Row_OnLeave)
+        row:SetScript("OnMouseUp", Row_OnMouseUp)
 
         uiState.rowPool[idx] = row
     end
@@ -444,6 +732,70 @@ local function GetOrCreateRow(parent, idx, rowW)
     if row._hoverBg then row._hoverBg:Hide() end
     row:SetParent(parent)
     row:SetSize(rowW, 52)
+    row:Show()
+    return row
+end
+
+local function GetOrCreateSubRow(parent, idx, rowW)
+    local row = uiState.subRowPool[idx]
+    if not row then
+        row = CreateFrame("Frame", nil, parent)
+        row:EnableMouse(true)
+
+        local bg = Theme:SolidTex(row, "BACKGROUND", 0, 0, 0, 0.28)
+        bg:SetAllPoints()
+        row._bg = bg
+
+        local hoverBg = Theme:SolidTex(row, "BACKGROUND", 1, 1, 1, 0.04)
+        hoverBg:SetAllPoints()
+        hoverBg:SetDrawLayer("BACKGROUND", 1)
+        hoverBg:Hide()
+        row._hoverBg = hoverBg
+
+        local div = Theme:SolidTex(row, "BORDER", 1, 1, 1, 0.03)
+        div:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+        div:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+        div:SetHeight(1)
+
+        local stripe = Theme:SolidTex(row, "ARTWORK", 0.56, 0.72, 1.0, 0.75)
+        stripe:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+        stripe:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+        stripe:SetWidth(2)
+        row._stripe = stripe
+
+        local metaFS = Theme:MakeFont(row, 11, "", 1, 1, 1, 0.65)
+        metaFS:SetPoint("TOPLEFT", row, "TOPLEFT", 12, -4)
+        metaFS:SetPoint("RIGHT", row, "RIGHT", -78, 0)
+        metaFS:SetJustifyH("LEFT")
+        metaFS:SetWordWrap(false)
+        row._metaFS = metaFS
+
+        local noteFS = Theme:MakeFont(row, 11, "", 0.85, 0.85, 0.85, 0.86)
+        noteFS:SetPoint("TOPLEFT", metaFS, "BOTTOMLEFT", 0, -2)
+        noteFS:SetPoint("RIGHT", row, "RIGHT", -78, 0)
+        noteFS:SetJustifyH("LEFT")
+        noteFS:SetWordWrap(false)
+        row._noteFS = noteFS
+
+        local dismissBtn = Theme:MakeButton(row, "Dismiss", 58, 20, 10)
+        dismissBtn:SetPoint("RIGHT", row, "RIGHT", -10, 0)
+        InitRowButton(dismissBtn, row)
+        dismissBtn._baseBrd = { 1, 1, 1, 0.20 }
+        dismissBtn._brd:SetColor(1, 1, 1, 0.20)
+        dismissBtn._tooltipText = "Hide this synced note locally without muting the peer."
+        dismissBtn._action = "dismiss_group"
+        row._dismissBtn = dismissBtn
+
+        row:SetScript("OnEnter", Row_OnEnter)
+        row:SetScript("OnLeave", Row_OnLeave)
+        row:SetScript("OnMouseUp", Row_OnMouseUp)
+
+        uiState.subRowPool[idx] = row
+    end
+
+    if row._hoverBg then row._hoverBg:Hide() end
+    row:SetParent(parent)
+    row:SetSize(rowW, 36)
     row:Show()
     return row
 end
@@ -492,8 +844,9 @@ RepaintEntriesList = function()
             row._bg:SetColorTexture(0, 0, 0, (i % 2 == 1) and Theme.ROW_ODD_A or Theme.ROW_EVEN_A)
 
             local cr, cg, cb = Guard.GetClassRGB(item.class)
-            row._nameFS:SetTextColor(cr, cg, cb, 1)
-            row._nameFS:SetText(item.name or "?")
+            row._nameFS:SetTextColor(1, 1, 1, 1)
+            row._nameFS:SetText(Guard.FormatPlayerNameColored(item.name or "?", cr, cg, cb))
+            if row._timeFS then row._timeFS:Hide() end
 
             local match = DB:Lookup(item.name, item.guid, true)
             if match then
@@ -512,9 +865,16 @@ RepaintEntriesList = function()
 
             local ctx = (item.context and item.context ~= "") and ("Last seen: " .. item.context) or "Last seen in group"
             if match then
-                local lbl = match.effectiveType == ns.LIST_GREEN
-                    and (goodHex .. "[Good Boi]|r ")
-                    or (badHex .. "[Bad Boi]|r ")
+                local lbl
+                if match.personal then
+                    lbl = match.effectiveType == ns.LIST_GREEN
+                        and (goodHex .. "[Good Boi]|r ")
+                        or (badHex .. "[Bad Boi]|r ")
+                else
+                    lbl = match.effectiveType == ns.LIST_GREEN
+                        and (goodHex .. "[Peer: Good Boi]|r ")
+                        or (badHex .. "[Peer: Bad Boi]|r ")
+                end
                 row._noteFS:SetText(lbl .. ctx)
             else
                 row._noteFS:SetText(ctx)
@@ -523,6 +883,7 @@ RepaintEntriesList = function()
             row._mode = "recent"
             row._item = item
             row._rec = nil
+            row._personalEntry = match and match.personal or nil
             row._roleTxt = roleTxt
             row._ctx = ctx
             row._seenTxt = seenTxt
@@ -530,23 +891,36 @@ RepaintEntriesList = function()
             row._classRGB[1], row._classRGB[2], row._classRGB[3] = cr, cg, cb
 
             row._btn3:Hide()
-            row._btn2:SetSize(78, 24)
-            row._btn1:SetSize(84, 24)
-            row._btn2:Show()
-            row._btn1:Show()
-            SetRowTextRightBound(row, -192)
+            if match and match.personal then
+                row._btn2:Hide()
+                row._btn1:SetSize(66, 24)
+                row._btn1:Show()
+                SetRowTextRightBound(row, -92)
 
-            row._btn2._lbl:SetText("+ Bad Boi")
-            row._btn2._baseBrd = { br, bg, bb, 0.65 }
-            row._btn2._brd:SetColor(br, bg, bb, 0.65)
-            row._btn2._tooltipText = nil
-            row._btn2._action = "recent_black"
+                row._btn1._lbl:SetText("Edit")
+                row._btn1._baseBrd = { 1, 1, 1, 0.24 }
+                row._btn1._brd:SetColor(1, 1, 1, 0.24)
+                row._btn1._tooltipText = "Edit your note for this player."
+                row._btn1._action = "recent_edit"
+            else
+                row._btn2:SetSize(78, 24)
+                row._btn1:SetSize(84, 24)
+                row._btn2:Show()
+                row._btn1:Show()
+                SetRowTextRightBound(row, -192)
 
-            row._btn1._lbl:SetText("+ Good Boi")
-            row._btn1._baseBrd = { gr, gg, gb, 0.65 }
-            row._btn1._brd:SetColor(gr, gg, gb, 0.65)
-            row._btn1._tooltipText = nil
-            row._btn1._action = "recent_green"
+                row._btn2._lbl:SetText("+ Bad Boi")
+                row._btn2._baseBrd = { br, bg, bb, 0.65 }
+                row._btn2._brd:SetColor(br, bg, bb, 0.65)
+                row._btn2._tooltipText = nil
+                row._btn2._action = "recent_black"
+
+                row._btn1._lbl:SetText("+ Good Boi")
+                row._btn1._baseBrd = { gr, gg, gb, 0.65 }
+                row._btn1._brd:SetColor(gr, gg, gb, 0.65)
+                row._btn1._tooltipText = nil
+                row._btn1._action = "recent_green"
+            end
 
             y = y - 52
         end
@@ -566,14 +940,15 @@ RepaintEntriesList = function()
             uiState.emptyFS:SetParent(parent)
             uiState.emptyFS:ClearAllPoints()
             uiState.emptyFS:SetPoint("TOP", parent, "TOP", 0, -28)
-            uiState.emptyFS:SetText("No entries match the current filter. Use the form above to add a player.")
+            uiState.emptyFS:SetText("No entries match the current filter. Click + Add above or right-click any player.")
             uiState.emptyFS:Show()
             return 100
         end
 
+        local subIdx = 0
         for i = 1, #items do
             local rec = items[i]
-            local entry = rec.entry
+            local entry = rec.primary or rec.entry
             local row = GetOrCreateRow(parent, i, rowW)
             uiState.activeRows[#uiState.activeRows + 1] = row
             row:ClearAllPoints()
@@ -583,24 +958,70 @@ RepaintEntriesList = function()
             if listType == ns.LIST_GREEN then
                 row._stripe:SetColorTexture(gr, gg, gb, rec.isMine and 0.95 or 0.55)
             else
-                local sev = entry.severity or 2
+                local sev = rec.maxSeverity or entry.severity or 2
                 local sa = (sev == 3 and 1.0) or (sev == 2 and 0.78) or 0.42
                 if not rec.isMine then sa = sa * 0.65 end
                 row._stripe:SetColorTexture(br, bg, bb, sa)
             end
 
-            local cr, cg, cb = Guard.GetClassRGB(entry.class)
-            row._nameFS:SetTextColor(cr, cg, cb, 1)
-            row._nameFS:SetText(entry.name or entry.key)
+            local cr, cg, cb = Guard.GetClassRGB(rec.class or entry.class)
+            row._nameFS:SetTextColor(1, 1, 1, 1)
+            row._nameFS:SetText(Guard.FormatPlayerNameColored(rec.name or entry.name or rec.key, cr, cg, cb))
+            if row._timeFS then
+                row._timeFS:SetText(Guard.FormatRelativeTime(rec.latestUpdatedAt or entry.updatedAt))
+            end
 
-            local srcTag = rec.isMine and (goodHex .. "[You]|r") or ("|cff8fb8ff[" .. tostring(rec.authorLabel) .. "]|r")
+            local expandKey = tostring(listType) .. ":" .. tostring(rec.key)
+            local isExpanded = rec.hasExpandableDetails and (uiState.expandedKeys[expandKey] == true)
+            local expandHint = isExpanded and "[-]" or "[+]"
+
+            local tags = {}
+            if rec.isMine then
+                if rec.distinctNoteCount > 0 then
+                    tags[#tags + 1] = "|cff8fb8ff+" .. rec.distinctNoteCount .. " peer " .. (rec.distinctNoteCount == 1 and "note" or "notes") .. " " .. expandHint .. "|r"
+                elseif rec.peerCount == 1 then
+                    tags[#tags + 1] = "|cff8fb8ff+ " .. tostring(rec.peers[1].shortLabel or rec.peers[1].authorLabel) .. "|r"
+                elseif rec.peerCount > 1 then
+                    tags[#tags + 1] = "|cff8fb8ff+" .. rec.peerCount .. " peers|r"
+                end
+                if entry.share == false then
+                    tags[#tags + 1] = "|cff888888Local|r"
+                end
+                if listType == ns.LIST_BLACK and entry.nativeIgnore == true then
+                    tags[#tags + 1] = "|cff999999Ignored|r"
+                end
+            else
+                if rec.distinctNoteCount > 0 then
+                    tags[#tags + 1] = "|cff8fb8ff" .. tostring(rec.primaryShortLabel) .. " (+" .. rec.distinctNoteCount .. " " .. (rec.distinctNoteCount == 1 and "note" or "notes") .. ") " .. expandHint .. "|r"
+                elseif rec.peerCount > 1 then
+                    tags[#tags + 1] = "|cff8fb8ff" .. tostring(rec.primaryShortLabel) .. " +" .. (rec.peerCount - 1) .. "|r"
+                else
+                    tags[#tags + 1] = "|cff8fb8ff" .. tostring(rec.primaryShortLabel) .. "|r"
+                end
+            end
+
+            if rec.conflictCount > 0 then
+                local oppWord = (listType == ns.LIST_GREEN) and "Bad Boi" or "Good Boi"
+                local oppHex = (listType == ns.LIST_GREEN) and badHex or goodHex
+                local cSuffix = (rec.distinctNoteCount == 0) and (" " .. expandHint) or ""
+                local cPrefix = (rec.conflictCount == 1) and "! Peer: " or ("! " .. rec.conflictCount .. " peers: ")
+                tags[#tags + 1] = oppHex .. cPrefix .. oppWord .. cSuffix .. "|r"
+            end
+
+            local metaPrefix = (#tags > 0) and (table.concat(tags, "  ") .. "  ") or ""
             local sevTag = (listType == ns.LIST_BLACK) and (SEP .. (SEVERITY_COLOR_LABELS[entry.severity or 2] or "Warn")) or ""
-            row._metaFS:SetText(string.format("%s  %s%s%s%s", srcTag, entry.category or "Other", sevTag, SEP, Guard.FormatRelativeTime(entry.updatedAt)))
+            row._metaFS:SetText(string.format("%s%s%s", metaPrefix, entry.category or "Other", sevTag))
 
             local notePreview = (entry.sharedNote ~= "" and entry.sharedNote) or ""
             if rec.isMine and entry.privateNote and entry.privateNote ~= "" then
                 notePreview = (notePreview ~= "" and (notePreview .. "  |cff999999[Private: " .. entry.privateNote .. "]|r")
                     or ("|cff999999[Private: " .. entry.privateNote .. "]|r"))
+            end
+            if notePreview == "" and rec.isMine and rec.distinctPeerGroups and rec.distinctPeerGroups[1] then
+                local g = rec.distinctPeerGroups[1]
+                if g.sharedNote and g.sharedNote ~= "" and g.authors and g.authors[1] then
+                    notePreview = "|cff8fb8ff" .. tostring(g.authors[1].shortLabel or g.authors[1].authorLabel) .. ":|r " .. g.sharedNote
+                end
             end
             if notePreview == "" then
                 notePreview = (entry.context and entry.context ~= "") and ("Context: " .. entry.context) or "(No note)"
@@ -610,6 +1031,7 @@ RepaintEntriesList = function()
             row._mode = "entry"
             row._rec = rec
             row._item = nil
+            row._personalEntry = nil
             row._listType = listType
             row._pageName = pageName
             row._classRGB = row._classRGB or { 1, 1, 1 }
@@ -619,8 +1041,8 @@ RepaintEntriesList = function()
                 row._btn1:SetSize(70, 24)
                 row._btn2:SetSize(62, 24)
                 row._btn3:SetSize(70, 24)
-                row._btn1:Show()
-                row._btn2:Show()
+                row._wantBtn1 = true
+                row._wantBtn2 = true
 
                 row._btn1._lbl:SetText("Remove")
                 row._btn1._baseBrd = { br, bg, bb, 0.55 }
@@ -635,7 +1057,7 @@ RepaintEntriesList = function()
                 row._btn2._action = "edit"
 
                 if listType == ns.LIST_BLACK then
-                    row._btn3:Show()
+                    row._wantBtn3 = true
                     row._btn3._lbl:SetText(entry.nativeIgnore and "Ignored" or "/ignore")
                     if entry.nativeIgnore then
                         row._btn3._baseBrd = { gr, gg, gb, 0.85 }
@@ -646,33 +1068,87 @@ RepaintEntriesList = function()
                     end
                     row._btn3._tooltipText = "Toggle Blizzard native /ignore for this player."
                     row._btn3._action = "ignore"
-                    SetRowTextRightBound(row, -230)
+                    row._hoverRightPad = -230
                 else
-                    row._btn3:Hide()
-                    SetRowTextRightBound(row, -156)
+                    row._wantBtn3 = false
+                    row._hoverRightPad = -156
                 end
             else
-                row._btn3:Hide()
-                row._btn1:SetSize(80, 24)
-                row._btn2:SetSize(64, 24)
-                row._btn2:Show()
-                row._btn1:Show()
-                SetRowTextRightBound(row, -168)
+                row._wantBtn3 = false
+                row._wantBtn2 = true
+                row._wantBtn1 = true
+                row._btn1:SetSize(28, 24)
+                row._btn2:SetSize(94, 24)
+                row._hoverRightPad = -148
 
-                row._btn2._lbl:SetText("Copy")
-                row._btn2._baseBrd = { 1, 1, 1, 0.24 }
-                row._btn2._brd:SetColor(1, 1, 1, 0.24)
-                row._btn2._tooltipText = "Save a personal copy to your own list."
-                row._btn2._action = "copy"
+                row._btn2._lbl:SetText("Save to Mine")
+                if listType == ns.LIST_GREEN then
+                    row._btn2._baseBrd = { gr, gg, gb, 0.55 }
+                    row._btn2._brd:SetColor(gr, gg, gb, 0.55)
+                else
+                    row._btn2._baseBrd = { 1, 1, 1, 0.28 }
+                    row._btn2._brd:SetColor(1, 1, 1, 0.28)
+                end
+                row._btn2._tooltipText = "Save a local copy to your personal list (not re-shared until edited)."
+                row._btn2._action = "adopt"
 
-                row._btn1._lbl:SetText("Mute Peer")
-                row._btn1._baseBrd = { br, bg, bb, 0.50 }
-                row._btn1._brd:SetColor(br, bg, bb, 0.50)
-                row._btn1._tooltipText = "Hide synced entries from this peer locally."
-                row._btn1._action = "mute"
+                row._btn1._lbl:SetText("...")
+                row._btn1._baseBrd = { 1, 1, 1, 0.24 }
+                row._btn1._brd:SetColor(1, 1, 1, 0.24)
+                row._btn1._tooltipText = "More peer actions (Save & Edit, Dismiss entry, Mute peer)."
+                row._btn1._action = "peer_menu"
             end
 
+            SetRowHovered(row, row.IsMouseOver and row:IsMouseOver() or false)
             y = y - 52
+
+            if isExpanded then
+                local function RenderSubGroupList(groups, isConflict)
+                    if not groups then return end
+                    for gi = 1, #groups do
+                        local g = groups[gi]
+                        subIdx = subIdx + 1
+                        local sr = GetOrCreateSubRow(parent, subIdx, rowW - 18)
+                        uiState.activeSubRows[#uiState.activeSubRows + 1] = sr
+                        sr:ClearAllPoints()
+                        sr:SetPoint("TOPLEFT", parent, "TOPLEFT", pad + 18, y)
+
+                        if isConflict then
+                            if g.listType == ns.LIST_GREEN then
+                                sr._stripe:SetColorTexture(gr, gg, gb, 0.85)
+                            else
+                                sr._stripe:SetColorTexture(br, bg, bb, 0.85)
+                            end
+                        else
+                            sr._stripe:SetColorTexture(0.56, 0.72, 1.0, 0.75)
+                        end
+
+                        local authTxt = FormatAuthorsSummary(g.authors, true, 3)
+                        local cBadge = ""
+                        if isConflict then
+                            cBadge = (g.listType == ns.LIST_GREEN) and (goodHex .. " [Good Boi]|r") or (badHex .. " [Bad Boi]|r")
+                        end
+                        local gSev = (g.listType == ns.LIST_BLACK) and (SEP .. (SEVERITY_COLOR_LABELS[g.severity or 2] or "Warn")) or ""
+                        sr._metaFS:SetText(string.format("|cff8fb8ff%s|r%s  %s%s%s%s", authTxt, cBadge, g.category or "Other", gSev, SEP, Guard.FormatRelativeTime(g.updatedAt)))
+
+                        local gNote = (g.sharedNote ~= "" and g.sharedNote)
+                            or (g.context and g.context ~= "" and ("Context: " .. g.context))
+                            or "(No note)"
+                        sr._noteFS:SetText(gNote)
+
+                        sr._mode = "subrow"
+                        sr._rec = rec
+                        sr._group = g
+                        sr._classRGB = sr._classRGB or { 1, 1, 1 }
+                        sr._classRGB[1], sr._classRGB[2], sr._classRGB[3] = cr, cg, cb
+                        SetRowHovered(sr, sr.IsMouseOver and sr:IsMouseOver() or false)
+
+                        y = y - 36
+                    end
+                end
+                RenderSubGroupList(rec.distinctPeerGroups, false)
+                RenderSubGroupList(rec.conflictGroups, true)
+            end
         end
     end
 
@@ -685,37 +1161,39 @@ RepaintEntriesList = function()
 end
 
 local function FormatCountSummary(listType, pageName, shownCount)
-    local total, mine, synced
+    local total, mine, peerOnly, shared
     if DB.GetListCounts then
-        total, mine, synced = DB:GetListCounts(listType)
+        total, mine, peerOnly, shared = DB:GetListCounts(listType)
     else
         local c = DB:GetCounts()
         if listType == ns.LIST_GREEN then
-            mine, synced = c.myGreen or 0, c.peerGreen or 0
+            mine, peerOnly = c.myGreen or 0, c.peerOnlyGreen or 0
         else
-            mine, synced = c.myBlack or 0, c.peerBlack or 0
+            mine, peerOnly = c.myBlack or 0, c.peerOnlyBlack or 0
         end
-        total = mine + synced
+        total = mine + peerOnly
+        shared = 0
     end
 
-    local summary
     if shownCount ~= nil and shownCount ~= total then
-        summary = string.format("Showing %d of %d %s", shownCount, total, pageName)
-    else
-        summary = string.format("%d total  |  %d yours  |  %d synced", total, mine, synced)
+        return string.format("Showing %d of %d %s", shownCount, total, pageName)
     end
 
-    local onlineCount = Sync.GetOnlinePeerCount and Sync:GetOnlinePeerCount() or 0
-    if onlineCount > 0 then
-        local pWord = (onlineCount == 1) and "peer" or "peers"
-        summary = summary .. "  |  " .. Theme:GetGoodHex() .. onlineCount .. " " .. pWord .. " online|r"
+    local parts = {
+        string.format("%d %s", total, total == 1 and "player" or "players"),
+        string.format("%d yours", mine),
+    }
+    if (peerOnly or 0) > 0 then
+        parts[#parts + 1] = string.format("%d from peers", peerOnly)
+    elseif (shared or 0) > 0 then
+        parts[#parts + 1] = string.format("%d also on peers", shared)
     end
-    return summary
+    return table.concat(parts, "  |  ")
 end
 
-local function BuildSearchToolbar(headerFrame, pad, innerW, y, pageName, includeFilters, onUpdateSummary)
+local function BuildSearchToolbar(headerFrame, pad, innerW, y, pageName, includeFilters, onUpdateSummary, listType)
     local isBadPage = (includeFilters and pageName == PAGE_BAD)
-    local rightUsed = includeFilters and (isBadPage and 414 or 310) or 202
+    local rightUsed = includeFilters and (isBadPage and 412 or 314) or 112
     local searchW = math.max(150, innerW - rightUsed)
     local placeholder = (pageName == PAGE_BAD and "Filter Bad Bois by name, tag, note, or friend...")
         or (pageName == PAGE_GOOD and "Filter Good Bois by name, tag, note, or friend...")
@@ -770,36 +1248,38 @@ local function BuildSearchToolbar(headerFrame, pad, innerW, y, pageName, include
         end)
     end)
 
-    local syncBtn = MakeEUIButton(headerFrame, "Sync Now", 86, 28, 12, function()
-        local status = Sync:SyncNow()
-        ns.Print(Sync:FormatSyncStatus(status))
-    end)
-    syncBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, y)
-
     if includeFilters then
+        local addTint = (listType == ns.LIST_GREEN) and "green" or "red"
+        local addBtn = MakeEUIButton(headerFrame, "+ Add", 82, 28, 12, function()
+            if ns.QuickModal then
+                ns.QuickModal:Open({ listType = listType })
+            end
+        end, addTint, "Add a player to " .. pageName .. ".")
+        addBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, y)
+
         local sortCycle = { newest = "name", name = "category", category = "newest" }
         local sortLbls = { newest = "Sort: Newest", name = "Sort: Name", category = "Sort: Tag" }
-        local sortBtn = MakeEUIButton(headerFrame, sortLbls[uiState.sortBy], 106, 28, 12, function(self)
+        local sortBtn = MakeEUIButton(headerFrame, sortLbls[uiState.sortBy], 102, 28, 12, function(self)
             uiState.sortBy = sortCycle[uiState.sortBy] or "newest"
             self._lbl:SetText(sortLbls[uiState.sortBy])
             RepaintEntriesList()
         end, nil, "Sort list by Newest, Name, or Category.")
-        sortBtn:SetPoint("RIGHT", syncBtn, "LEFT", -6, 0)
+        sortBtn:SetPoint("RIGHT", addBtn, "LEFT", -6, 0)
 
         local srcCycle = { all = "mine", mine = "peers", peers = "all" }
-        local srcLbls = { all = "Src: All", mine = "Src: Mine", peers = "Src: Synced" }
-        local srcBtn = MakeEUIButton(headerFrame, srcLbls[uiState.sourceFilter], 96, 28, 12, function(self)
+        local srcLbls = { all = "Src: All", mine = "Src: Mine", peers = "Src: Peer-Only" }
+        local srcBtn = MakeEUIButton(headerFrame, srcLbls[uiState.sourceFilter], 106, 28, 12, function(self)
             uiState.sourceFilter = srcCycle[uiState.sourceFilter] or "all"
             self._lbl:SetText(srcLbls[uiState.sourceFilter])
             RepaintEntriesList()
             if onUpdateSummary then onUpdateSummary() end
-        end, nil, "Filter source: All entries, Yours only, or Synced peers.")
+        end, nil, "Filter source: All players, Your list only, or Peer-only players not on your list.")
         srcBtn:SetPoint("RIGHT", sortBtn, "LEFT", -6, 0)
 
         local sevFilterBtn
         local sevFilterLbls = { [1] = "Sev: All", [2] = "Sev: Warn+", [3] = "Sev: Avoid" }
         if isBadPage then
-            sevFilterBtn = MakeEUIButton(headerFrame, sevFilterLbls[uiState.minSeverity or 1], 96, 28, 12, function(self)
+            sevFilterBtn = MakeEUIButton(headerFrame, sevFilterLbls[uiState.minSeverity or 1], 92, 28, 12, function(self)
                 uiState.minSeverity = ((uiState.minSeverity or 1) % 3) + 1
                 self._lbl:SetText(sevFilterLbls[uiState.minSeverity])
                 RepaintEntriesList()
@@ -830,7 +1310,7 @@ local function BuildSearchToolbar(headerFrame, pad, innerW, y, pageName, include
             if DB:Root() then wipe(DB:Root().recent) end
             RepaintEntriesList()
         end)
-        clrBtn:SetPoint("RIGHT", syncBtn, "LEFT", -6, 0)
+        clrBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, y)
         return function()
             if (searchBox:GetText() or "") ~= (uiState.search or "") then
                 if uiState.searchTimer then
@@ -850,302 +1330,67 @@ local function BuildEntryPageHeader(headerFrame, width, pageName, listType)
     local eui = _G.EllesmereUI
     local pad = (eui and eui.CONTENT_PAD) or 40
     local innerW = math.max(540, width - pad * 2)
-    local isBlack = (listType == ns.LIST_BLACK)
-    local form = uiState.forms[listType]
-    local isRefreshing = false
 
-    -- Title Bar (mirrors EllesmereUI W:SectionHeader)
-    local sectionTitle = Theme:MakeFont(headerFrame, 12, "", 1, 1, 1, 0.45)
-    sectionTitle:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -9)
-    sectionTitle:SetJustifyH("LEFT")
+    local countFS = Theme:MakeFont(headerFrame, 11, "", 1, 1, 1, 0.48)
+    countFS:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -8)
+    countFS:SetJustifyH("LEFT")
 
-    local countFS = Theme:MakeFont(headerFrame, 11, "", 1, 1, 1, 0.42)
-    countFS:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -9)
+    local syncStatusBtn = CreateFrame("Button", nil, headerFrame)
+    syncStatusBtn:SetHeight(18)
+    syncStatusBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -6)
+    local syncLbl = Theme:MakeFont(syncStatusBtn, 11, "", 1, 1, 1, 0.72)
+    syncLbl:SetPoint("RIGHT", syncStatusBtn, "RIGHT", -2, 0)
+    syncLbl:SetJustifyH("RIGHT")
 
-    local cancelEditBtn = MakeEUIButton(headerFrame, "Cancel Edit", 86, 20, 11)
-    cancelEditBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -6)
-
-    local topDiv = Theme:SolidTex(headerFrame, "ARTWORK", 1, 1, 1, 0.04)
-    topDiv:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -27)
-    topDiv:SetSize(innerW, 1)
-
-    -- Row 1 (y = -34, h = 30): Player + Target + Category + (Severity) + Checkboxes
-    local rightAnchor, ignoreCB, refreshIgnoreCB
-    if isBlack then
-        ignoreCB, refreshIgnoreCB = MakeEUICheckbox(headerFrame, "/ignore",
-            "Also apply Blizzard's native /ignore to this player.",
-            function() return form.nativeIgnore end,
-            function(v) form.nativeIgnore = v end)
-        ignoreCB:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -35)
-        rightAnchor = ignoreCB
-    end
-
-    local shareCB, refreshShareCB = MakeEUICheckbox(headerFrame, isBlack and "Share" or "Share w/ Peers",
-        "Sync this entry with trusted Battle.net friends and guildmates.",
-        function() return form.share end,
-        function(v) form.share = v end)
-    if rightAnchor then
-        shareCB:SetPoint("RIGHT", rightAnchor, "LEFT", -10, 0)
-    else
-        shareCB:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -35)
-    end
-    rightAnchor = shareCB
-
-    local sevDD, sevBtn
-    local sevW = 0
-    local sevValues = isBlack and { [1] = "1 - Note", [2] = "2 - Warn", [3] = "3 - Hard Avoid" } or nil
-    if isBlack then
-        sevW = 148
-        local sevOrder = { 1, 2, 3 }
-        if eui and eui.BuildDropdownControl then
-            sevDD = eui.BuildDropdownControl(headerFrame, sevW, headerFrame:GetFrameLevel() + 5,
-                sevValues, sevOrder,
-                function() return form.severity or 2 end,
-                function(v) form.severity = v end)
-            sevDD:SetPoint("RIGHT", rightAnchor, "LEFT", -10, 0)
-            sevDD:HookScript("OnEnter", function(self)
-                Theme:ShowTooltip(self, "Alert severity: 1 = Note, 2 = Warn, 3 = Hard Avoid.")
-            end)
-            sevDD:HookScript("OnLeave", function() Theme:HideTooltip() end)
-            rightAnchor = sevDD
+    local function RefreshSyncStatusText(hovering)
+        local onlineCount = Sync.GetOnlinePeerCount and Sync:GetOnlinePeerCount() or 0
+        if onlineCount > 0 then
+            local pWord = (onlineCount == 1) and "peer" or "peers"
+            local syncHex = hovering and "|cffffffff" or "|cffbbbbbb"
+            syncLbl:SetText(Theme:GetGoodHex() .. onlineCount .. " " .. pWord .. " online|r  |cff555555/|r  " .. syncHex .. "Sync|r")
         else
-            sevBtn = Theme:MakeButton(headerFrame, sevValues[form.severity or 2], sevW, 30, 12, function(self)
-                form.severity = ((form.severity or 2) % 3) + 1
-                self._lbl:SetText(sevValues[form.severity])
-            end)
-            sevBtn:SetPoint("RIGHT", rightAnchor, "LEFT", -10, 0)
-            rightAnchor = sevBtn
+            local syncHex = hovering and "|cffffffff" or "|cff777777"
+            syncLbl:SetText(syncHex .. "Sync|r")
         end
+        local tw = syncLbl:GetStringWidth() or 40
+        syncStatusBtn:SetWidth(math.max(44, math.ceil(tw + 8)))
     end
+    RefreshSyncStatusText(false)
 
-    local catOrder = isBlack and ns.CATEGORIES.black or ns.CATEGORIES.green
-    local catValues = {}
-    for i = 1, #catOrder do
-        catValues[catOrder[i]] = catOrder[i]
-    end
-    local catW = isBlack and 158 or 200
-    local catDD, catBtn
-    if eui and eui.BuildDropdownControl then
-        catDD = eui.BuildDropdownControl(headerFrame, catW, headerFrame:GetFrameLevel() + 5,
-            catValues, catOrder,
-            function() return form.category or catOrder[1] end,
-            function(v) form.category = v end)
-        catDD:SetPoint("RIGHT", rightAnchor, "LEFT", -8, 0)
-        catDD:HookScript("OnEnter", function(self)
-            Theme:ShowTooltip(self, "Reason / category tag for this player.")
-        end)
-        catDD:HookScript("OnLeave", function() Theme:HideTooltip() end)
-        rightAnchor = catDD
-    else
-        catBtn = Theme:MakeButton(headerFrame, form.category or catOrder[1], catW, 30, 12, function(self)
-            local idx = 1
-            for i = 1, #catOrder do
-                if catOrder[i] == form.category then idx = i; break end
-            end
-            idx = (idx % #catOrder) + 1
-            form.category = catOrder[idx]
-            self._lbl:SetText(form.category)
-        end)
-        catBtn:SetPoint("RIGHT", rightAnchor, "LEFT", -8, 0)
-        rightAnchor = catBtn
-    end
-
-    local rightUsed = isBlack
-        and (ignoreCB:GetWidth() + 10 + shareCB:GetWidth() + 10 + sevW + 8 + catW + 10)
-        or (shareCB:GetWidth() + 10 + catW + 10)
-    local targetW = 68
-    local nameW = math.max(190, innerW - rightUsed - targetW - 6)
-
-    local nameHolder, nameBox = Theme:MakeEditBox(headerFrame, nameW, 30,
-        Guard.IsForever() and "Player Name" or "PlayerName-RealmName")
-    nameHolder:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -34)
-    nameBox:SetFont(Theme:GetFont(), 13, "")
-    nameBox:SetScript("OnTextChanged", function(self)
-        nameHolder.placeholder:SetShown((self:GetText() or "") == "")
-        if not isRefreshing then
-            form.name = self:GetText() or ""
-        end
+    syncStatusBtn:SetScript("OnEnter", function(self)
+        RefreshSyncStatusText(true)
+        Theme:ShowTooltip(self, "Click to run a manual sync handshake now.")
+    end)
+    syncStatusBtn:SetScript("OnLeave", function()
+        RefreshSyncStatusText(false)
+        Theme:HideTooltip()
+    end)
+    syncStatusBtn:SetScript("OnClick", function()
+        local status = Sync:SyncNow()
+        ns.Print(Sync:FormatSyncStatus(status))
     end)
 
-    local targetBtn = MakeEUIButton(headerFrame, "Target", targetW, 30, 12, function()
-        local units = { "target", "mouseover", "focus" }
-        for i = 1, #units do
-            local info = Guard.SafeUnitInfo(units[i])
-            if info and info.isPlayer and info.name then
-                form.name = info.name
-                form.guid = info.guid
-                form.class = info.class
-                isRefreshing = true
-                nameBox:SetText(info.name)
-                nameHolder.placeholder:Hide()
-                isRefreshing = false
-                return
-            end
-        end
-        ns.Print("Target a player first (or identity is restricted in this content).")
-    end, nil, Guard.IsForever()
-        and "Fill Player Name from your current target, mouseover, or focus."
-        or "Fill Player-Realm from your current target, mouseover, or focus.")
-    targetBtn:SetPoint("LEFT", nameHolder, "RIGHT", 6, 0)
-
-    -- Row 2 (y = -71, h = 30): Shared Note + Private Note + Primary Action
-    local submitW = 156
-    local notesAvail = innerW - submitW - 8
-    local sharedW = math.floor((notesAvail - 8) * 0.56)
-    local privateW = math.max(160, notesAvail - 8 - sharedW)
-
-    local sharedHolder, sharedBox = Theme:MakeEditBox(headerFrame, sharedW, 30, "Shared note (synced with friends & guild)...")
-    sharedHolder:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -71)
-    sharedBox:SetFont(Theme:GetFont(), 12, "")
-    sharedBox:SetScript("OnTextChanged", function(self)
-        sharedHolder.placeholder:SetShown((self:GetText() or "") == "")
-        if not isRefreshing then
-            form.sharedNote = self:GetText() or ""
-        end
-    end)
-
-    local privateHolder, privateBox = Theme:MakeEditBox(headerFrame, privateW, 30, "Private note (local only)...")
-    privateHolder:SetPoint("LEFT", sharedHolder, "RIGHT", 8, 0)
-    privateBox:SetFont(Theme:GetFont(), 12, "")
-    privateBox:SetScript("OnTextChanged", function(self)
-        privateHolder.placeholder:SetShown((self:GetText() or "") == "")
-        if not isRefreshing then
-            form.privateNote = self:GetText() or ""
-        end
-    end)
-
-    local submitBtn = MakeEUIButton(headerFrame,
-        isBlack and "+ Add to Bad Bois" or "+ Add to Good Bois",
-        submitW, 30, 12, nil, isBlack and "red" or "green")
-    submitBtn:SetPoint("TOPRIGHT", headerFrame, "TOPLEFT", pad + innerW, -71)
-
-    local midDiv = Theme:SolidTex(headerFrame, "ARTWORK", 1, 1, 1, 0.06)
-    midDiv:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -108)
-    midDiv:SetSize(innerW, 1)
+    local topDiv = Theme:SolidTex(headerFrame, "ARTWORK", 1, 1, 1, 0.05)
+    topDiv:SetPoint("TOPLEFT", headerFrame, "TOPLEFT", pad, -26)
+    topDiv:SetSize(innerW, 1)
 
     local function UpdateSummary(shownCount)
         local sc = shownCount
         if sc == nil then sc = uiState.lastShownCountByPage[pageName] end
         countFS:SetText(FormatCountSummary(listType, pageName, sc))
+        RefreshSyncStatusText(syncStatusBtn.IsMouseOver and syncStatusBtn:IsMouseOver() or false)
     end
     uiState.summaryUpdaterByPage[pageName] = UpdateSummary
 
-    -- Row 3 (y = -115, h = 28): Filter + Sort + Sync
-    local refreshSearch = BuildSearchToolbar(headerFrame, pad, innerW, -115, pageName, true, UpdateSummary)
+    local refreshSearch = BuildSearchToolbar(headerFrame, pad, innerW, -33, pageName, true, UpdateSummary, listType)
 
-    local function RefreshHeaderControls(focusNote)
-        isRefreshing = true
-        nameBox:SetText(form.name or "")
-        nameHolder.placeholder:SetShown((form.name or "") == "")
-        sharedBox:SetText(form.sharedNote or "")
-        sharedHolder.placeholder:SetShown((form.sharedNote or "") == "")
-        privateBox:SetText(form.privateNote or "")
-        privateHolder.placeholder:SetShown((form.privateNote or "") == "")
-        isRefreshing = false
-
-        if catDD and catDD._refreshLabel then
-            catDD._refreshLabel()
-        elseif catBtn then
-            catBtn._lbl:SetText(form.category or catOrder[1])
-        end
-        if sevDD and sevDD._refreshLabel then
-            sevDD._refreshLabel()
-        elseif sevBtn and sevValues then
-            sevBtn._lbl:SetText(sevValues[form.severity or 2] or "2 - Warn")
-        end
-
-        refreshShareCB()
-        if refreshIgnoreCB then refreshIgnoreCB() end
+    uiState.headerRefreshByPage[pageName] = function()
         if refreshSearch then refreshSearch() end
         UpdateSummary()
-
-        if form.editingKey then
-            local gr, gg, gb = Theme:GetGoodRGB()
-            if isBlack then
-                local br, bg, bb = Theme:GetBadRGB()
-                sectionTitle:SetTextColor(br, bg, bb, 0.96)
-                sectionTitle:SetText("EDIT BAD BOI: " .. tostring(form.editingName or form.editingKey))
-            else
-                sectionTitle:SetTextColor(gr, gg, gb, 0.96)
-                sectionTitle:SetText("EDIT GOOD BOI: " .. tostring(form.editingName or form.editingKey))
-            end
-            submitBtn._lbl:SetText("Save Changes")
-            cancelEditBtn:Show()
-            countFS:Hide()
-        else
-            sectionTitle:SetTextColor(1, 1, 1, 0.45)
-            sectionTitle:SetText(isBlack and "ADD TO BAD BOIS" or "ADD TO GOOD BOIS")
-            submitBtn._lbl:SetText(isBlack and "+ Add to Bad Bois" or "+ Add to Good Bois")
-            cancelEditBtn:Hide()
-            countFS:Show()
-        end
-
-        if focusNote then
-            sharedBox:SetFocus()
-        end
     end
+    UpdateSummary()
 
-    local function SubmitForm()
-        local raw = (nameBox:GetText() or ""):match("^%s*(.-)%s*$")
-        local key = Guard.NormalizeNameRealm(raw)
-        if not key then
-            ns.Print(Guard.IsForever()
-                and "Enter a valid Player Name first (or click Target)."
-                or "Enter a valid PlayerName-RealmName first (or click Target).")
-            nameBox:SetFocus()
-            return
-        end
-
-        local wasEdit = (form.editingKey ~= nil)
-        local prevKey = form.editingKey
-        local payload = {
-            name = raw,
-            guid = form.guid,
-            class = form.class,
-            listType = listType,
-            category = form.category,
-            severity = isBlack and (form.severity or 2) or 1,
-            sharedNote = sharedBox:GetText() or "",
-            privateNote = privateBox:GetText() or "",
-            share = form.share == true,
-            nativeIgnore = isBlack and (form.nativeIgnore == true) or false,
-        }
-        ResetForm(listType)
-        nameBox:ClearFocus()
-        sharedBox:ClearFocus()
-        privateBox:ClearFocus()
-        DB:AddOrUpdatePersonal(payload)
-        if wasEdit and prevKey and prevKey ~= key then
-            DB:RemovePersonal(prevKey)
-        end
-
-        ns.Print((wasEdit and "Updated " or "Added ") .. raw .. (isBlack and " on Bad Bois." or " on Good Bois."))
-        RefreshHeaderControls(false)
-    end
-
-    submitBtn:SetScript("OnClick", SubmitForm)
-    cancelEditBtn:SetScript("OnClick", function()
-        ResetForm(listType)
-        RefreshHeaderControls(false)
-    end)
-
-    nameBox:SetScript("OnEnterPressed", function()
-        if (sharedBox:GetText() or "") == "" and not form.editingKey then
-            sharedBox:SetFocus()
-        else
-            SubmitForm()
-        end
-    end)
-    sharedBox:SetScript("OnEnterPressed", SubmitForm)
-    privateBox:SetScript("OnEnterPressed", SubmitForm)
-    nameBox:SetScript("OnTabPressed", function() sharedBox:SetFocus() end)
-    sharedBox:SetScript("OnTabPressed", function() privateBox:SetFocus() end)
-    privateBox:SetScript("OnTabPressed", function() nameBox:SetFocus() end)
-
-    uiState.headerRefreshByPage[pageName] = RefreshHeaderControls
-    RefreshHeaderControls(false)
-
-    return 150
+    return 66
 end
 
 local function BuildListHeader(pageName)
@@ -1204,10 +1449,47 @@ local function PeerBtn_OnClick(self)
     end
 end
 
+local function PeerRow_OnEnter(self)
+    local p = self._peerData
+    if not p then return end
+    local lines = {
+        "Transport: " .. tostring(p.via or "SYNC"),
+        "Entries: " .. tostring(p.count or 0) .. "  |  Rev: " .. tostring(p.lastRev or 0),
+        p.online and "Status: Online now" or ("Last seen: " .. Guard.FormatRelativeTime(p.lastSeenAt)),
+    }
+    if (p.dismissedCount or 0) > 0 then
+        lines[#lines + 1] = "Dismissed locally: " .. tostring(p.dismissedCount) .. " (right-click to restore)"
+    end
+    Theme:ShowTooltip(self, p.label, lines)
+end
+
+local function PeerRow_OnLeave()
+    Theme:HideTooltip()
+end
+
+local function PeerRow_OnMouseUp(self, button)
+    if button ~= "RightButton" then return end
+    local p = self._peerData
+    if not p then return end
+    local dCount = DB:GetDismissedCount(p.authorID)
+    if dCount <= 0 then return end
+    Theme:ShowContextMenu(self, {
+        {
+            text = string.format("Restore Dismissed Entries (%d)", dCount),
+            onClick = function()
+                DB:ClearDismissedForPeer(p.authorID)
+                local eui = _G.EllesmereUI
+                if eui and eui.RefreshPage then eui:RefreshPage(true) end
+            end,
+        },
+    })
+end
+
 local function GetOrCreatePeerRow(parent, idx, rowW)
     local row = uiState.peerRowPool[idx]
     if not row then
         row = CreateFrame("Frame", nil, parent)
+        row:EnableMouse(true)
         local bg = Theme:SolidTex(row, "BACKGROUND", 0, 0, 0, Theme.ROW_ODD_A)
         bg:SetAllPoints()
         row._bg = bg
@@ -1248,6 +1530,10 @@ local function GetOrCreatePeerRow(parent, idx, rowW)
         relayBtn._action = "relay"
         relayBtn:SetScript("OnClick", PeerBtn_OnClick)
         row._relayBtn = relayBtn
+
+        row:SetScript("OnEnter", PeerRow_OnEnter)
+        row:SetScript("OnLeave", PeerRow_OnLeave)
+        row:SetScript("OnMouseUp", PeerRow_OnMouseUp)
 
         uiState.peerRowPool[idx] = row
     end
@@ -1325,6 +1611,8 @@ local function BuildPeerRows(parent, y)
     for i = 1, #list do
         local p = list[i]
         local trust = DB:GetPeerTrust(p.authorID)
+        local dismissedCount = DB:GetDismissedCount(p.authorID)
+        p.dismissedCount = dismissedCount
 
         local row = GetOrCreatePeerRow(parent, i, rowW)
         uiState.activePeerRows[#uiState.activePeerRows + 1] = row
@@ -1335,8 +1623,12 @@ local function BuildPeerRows(parent, y)
         row._bg:SetColorTexture(0, 0, 0, (i % 2 == 1) and Theme.ROW_ODD_A or Theme.ROW_EVEN_A)
         row._dot:SetColorTexture(p.online and gr or 0.5, p.online and gg or 0.5, p.online and gb or 0.5, 1)
         row._title:SetText(p.label)
-        row._sub:SetText(string.format("%s%s%d entries%srev %d%s%s",
-            p.via, SEP, p.count, SEP, p.lastRev, SEP, p.online and "Online now" or Guard.FormatRelativeTime(p.lastSeenAt)))
+        local subStr = string.format("%s%s%d entries%srev %d%s%s",
+            p.via, SEP, p.count, SEP, p.lastRev, SEP, p.online and "Online now" or Guard.FormatRelativeTime(p.lastSeenAt))
+        if dismissedCount > 0 then
+            subStr = subStr .. SEP .. dismissedCount .. " dismissed"
+        end
+        row._sub:SetText(subStr)
 
         row._muteBtn._lbl:SetText(trust.muted and "Muted" or "Active")
         if trust.muted then
@@ -1683,24 +1975,12 @@ local function BuildSettingsTab(parent, yOffset)
           getValue = function() return s.syncParty end,
           setValue = function(v) s.syncParty = v end },
         { type = "toggle", text = "1-Hop Trusted Relay",
-          tooltip = "Relay friend/guild updates so offline friends receive changes when any shared peer logs on.",
+          tooltip = "Relay updates across your enabled sync channels so offline friends receive changes when any shared peer logs on.",
           getValue = function() return s.syncRelay end,
           setValue = function(v) s.syncRelay = v end }
     ); y = y - h
 
     _, h = W:DualRow(parent, y,
-        { type = "dropdown", text = "Trust Scope",
-          values = {
-              friends_and_guild = "BNet Friends + Guild",
-              bnet_only = "BNet Friends Only",
-              guild_only = "Guild Only",
-          },
-          order = { "friends_and_guild", "bnet_only", "guild_only" },
-          getValue = function() return s.trustMode or "friends_and_guild" end,
-          setValue = function(v)
-              s.trustMode = v
-              Sync:SyncNow()
-          end },
         { type = "toggle", text = "Sync Good Bois Entries",
           tooltip = "Include positive Good Bois entries in peer sync.",
           getValue = function() return s.syncGreenEntries end,
@@ -1797,14 +2077,7 @@ function PluginPages:Register()
     })
 
     if ok then
-        ns:On("DB_CHANGED", function(kind, changedKey)
-            if kind == "personal_remove" and changedKey then
-                for _, lt in ipairs({ ns.LIST_BLACK, ns.LIST_GREEN }) do
-                    if uiState.forms[lt].editingKey == changedKey then
-                        ResetForm(lt)
-                    end
-                end
-            end
+        ns:On("DB_CHANGED", function()
             if IsPluginShown() and uiState.activePage ~= PAGE_SETTINGS then
                 local refreshHdr = uiState.headerRefreshByPage[uiState.activePage]
                 if refreshHdr then refreshHdr(false) end
@@ -1816,6 +2089,8 @@ function PluginPages:Register()
                 if uiState.activePage == PAGE_SETTINGS then
                     eui:RefreshPage(true)
                 else
+                    local refreshHdr = uiState.headerRefreshByPage[uiState.activePage]
+                    if refreshHdr then refreshHdr(false) end
                     RepaintEntriesList()
                 end
             end

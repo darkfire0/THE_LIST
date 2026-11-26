@@ -307,27 +307,21 @@ local function BuildBannerFrame()
     queueBadge:Hide()
     frame._queueBadge = queueBadge
 
-    local copyBtn = Theme:MakeButton(frame, "Copy", 46, 20, 10, function()
+    local copyBtn = Theme:MakeButton(frame, "Save", 46, 20, 10, function()
         local p = currentPayload
         local m = p and p.match
         if not (p and m and m.peers and #m.peers > 0 and not m.personal) then return end
         local entry = m.primary or m.peers[1].entry
         if not entry then return end
-        local saved = DB:AddOrUpdatePersonal({
-            name = entry.name or p.name,
-            guid = entry.guid or p.guid,
-            class = entry.class or p.class,
-            listType = entry.listType or m.effectiveType or ns.LIST_BLACK,
-            category = entry.category or "Other",
-            severity = entry.severity or 2,
-            sharedNote = entry.sharedNote or "",
-            context = entry.context or "",
-            share = true,
+        local saved = DB:AdoptPeerEntry(entry, {
+            guid = p.guid,
+            class = p.class,
+            listType = m.effectiveType or ns.LIST_BLACK,
         })
         if saved then
             m.personal = saved
         end
-        ns.Print("Copied " .. tostring(entry.name or p.name) .. " to your personal list.")
+        ns.Print("Saved " .. tostring(entry.name or p.name) .. " to your personal list (local only).")
         UpdateActionAndQueueLayout()
     end, "accent")
     copyBtn:Hide()
@@ -520,11 +514,20 @@ function Banner:ShowAlert(payload, previewMode)
     f._nameLbl:SetText(SanitizeText(payload.name or "Unknown", 64))
 
     local kindTxt = KIND_LABELS[payload.kind]
-    local src = SanitizeText(tostring((match and match.primarySource) or "You"), 48)
+    local rawSrc = tostring((match and match.primarySource) or "You")
+    if match and not match.personal and DB.GetShortPeerLabel then
+        local firstPeer = match.peers and match.peers[1]
+        rawSrc = DB:GetShortPeerLabel(firstPeer and firstPeer.authorID, rawSrc)
+    end
+    local src = SanitizeText(rawSrc, 48)
     local cat = SanitizeText(tostring((primary and primary.category) or "Other"), 32)
-    local peerExtra = (match and match.peers and #match.peers > 0 and match.personal) and (" (+" .. #match.peers .. " friend)")
-        or (match and match.peers and #match.peers > 1 and not match.personal) and (" (+" .. (#match.peers - 1) .. " more)")
-        or ""
+    local peerExtra = ""
+    if match and match.peers and #match.peers > 0 and match.personal then
+        local n = #match.peers
+        peerExtra = " (+" .. n .. (n == 1 and " friend)" or " friends)")
+    elseif match and match.peers and #match.peers > 1 and not match.personal then
+        peerExtra = " (+" .. (#match.peers - 1) .. " more)"
+    end
     local metaPrefix = (kindTxt and kindTxt ~= "") and (kindTxt .. "  |  ") or ""
     f._metaLbl:SetText(metaPrefix .. "Source: " .. src .. peerExtra .. "  |  " .. cat)
 
